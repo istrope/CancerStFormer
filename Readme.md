@@ -145,7 +145,7 @@ embeddings = extractor.extract_embs(
 
 )
 ```
-### 6. Classification
+### 4. Classification
 
 ```python
 from stFormer.classifier.Classifier import GenericClassifier
