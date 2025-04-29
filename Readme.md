@@ -69,7 +69,7 @@ estimator = MedianEstimator(
 )
 estimator.compute_tdigests(
       file_path #optional processes single file, unless loads all in data_dir
-      )
+)
 estimator.get_median_dict()
 estimator.write_tdigests() # write to file in out_path
 estimator.write_medians() # write to file in out_path
