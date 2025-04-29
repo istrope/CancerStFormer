@@ -41,6 +41,14 @@ A flexible framework for transformer-based analysis of spatial transcriptomics d
   - Gene-marker extraction and ranking with Scanpy.
   - Parallelized DE testing and outlier removal for UMAP embeddings.
 
+- **Utility Scripts**
+
+  - Loads model attention from MaskedBertModel
+  - Computes average attention for genes in batch-wise manner
+  - computes attention across layers/heads for all unique token pairs
+  - filters node-edges by (weight value, weight percentile, or top n edges)
+  - filters noe-edges by number of co-occuring tokens in dataset
+
 ## Installation
 
 ```bash
