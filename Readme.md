@@ -60,14 +60,20 @@ pip install -r requirements.txt
 ### 1. Tokenization and Median Estimator
 ``` python
 # Compute T-Digests
-from stFormer.tokenization.median_estimator import MedianEstimator, merge_tdigest_dicts,
+from stFormer.tokenization.median_estimator import MedianEstimator
 estimator = MedianEstimator(
-                data_dir = 'data', # directory for datasets
-                extension = '.h5ad', # file extension (h5ad/loom)
-                out_path = 'output', #output director
-                merge_tdigests = True # set to true if there are multiple datasets to merge tdigests
-              ) 
+    data_dir = 'data',
+    extension = '.h5ad',
+    out_path = 'output',
+    merge_tdigests = True 
+)
+estimator.compute_tdigests(
+      file_path #optional processes single file, unless loads all in data_dir)
+estimator.get_median_dict()
+estimator.write_tdigests() # write to file in out_path
+estimator.write_medians() # write to file in out_path
 ```
+
 ```python
 from stFormer.tokenization.SpatialTokenize import SpatialTokenizer, create_token_dictionary
 
