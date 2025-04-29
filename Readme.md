@@ -34,20 +34,21 @@ A flexible framework for transformer-based analysis of spatial transcriptomics d
   - Utilities for training cell-type or gene classifiers with Hugging Face Transformers.
   - Ray Tune experiments for hyperparameter optimization.
   - Best-model extraction and checkpoint management.
-
-- **Utility Scripts**
-
-  - Dataset inspection: view `input_ids`, `length`, and metadata fields in Hugging Face `.dataset` files.
-  - Gene-marker extraction and ranking with Scanpy.
-  - Parallelized DE testing and outlier removal for UMAP embeddings.
-
-- **Utility Scripts**
+    
+- **Network Dynamics**
 
   - Loads model attention from MaskedBertModel
   - Computes average attention for genes in batch-wise manner
   - computes attention across layers/heads for all unique token pairs
   - filters node-edges by (weight value, weight percentile, or top n edges)
   - filters noe-edges by number of co-occuring tokens in dataset
+- **Utility Scripts**
+
+  - Dataset inspection: view `input_ids`, `length`, and metadata fields in Hugging Face `.dataset` files.
+  - Gene-marker extraction and ranking with Scanpy.
+  - Parallelized DE testing and outlier removal for UMAP embeddings.
+
+
 
 ## Installation
 
