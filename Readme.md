@@ -42,6 +42,7 @@ A flexible framework for transformer-based analysis of spatial transcriptomics d
   - computes attention across layers/heads for all unique token pairs
   - filters node-edges by (weight value, weight percentile, or top n edges)
   - filters noe-edges by number of co-occuring tokens in dataset
+
 - **Utility Scripts**
 
   - Dataset inspection: view `input_ids`, `length`, and metadata fields in Hugging Face `.dataset` files.
@@ -62,7 +63,7 @@ pip install torch torchaudio torchtext
 pip install -r requirements.txt
 ```
 
-> **Prerequisites:** Python 3.8+, PyTorch, Transformers, Datasets, Scanpy, Anndata, Ray Tune.
+> **Prerequisites:** Python 3.8+, PyTorch, Transformers
 
 ## Usage
 
@@ -181,9 +182,7 @@ trainer = classifier.train(
     model_checkpoint='output/spot/models/250422_102707_stFormer_L6_E3/final',
     dataset_path = ds_path,
     output_directory = 'output/models/classification',
-    test_size=0.2, #create test/train split
-    #
-    stratify=False
+    test_size=0.2 #create test/train split
 )
 ```
 ```python
@@ -213,8 +212,7 @@ best_run = classifier.train(
     dataset_path = ds_path,
     output_directory = 'output/models/tuned_classification',
     n_trials=10,
-    test_size=0.2, #Test/Train Split
-    stratify=False
+    test_size=0.2 #Test/Train Split
 )
 ```
 

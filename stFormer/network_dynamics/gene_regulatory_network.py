@@ -50,7 +50,7 @@ Future Functionality:
 
 import logging
 from pathlib import Path
-from typing import Optional, Literal
+from typing import Optional, Literal, Dict
 from torch.utils.data import DataLoader
 import numpy as np
 import torch
@@ -268,16 +268,20 @@ class GeneRegulatoryNetwork:
         unique_tids = list(sample_presence.keys())
         logger.info(f"Found {len(unique_tids)} unique tokens across samples")
 
-        # Build counts matrix over positions
-        logger.info(f"Looking through {len(unique_tids)} unique tokens to determine co-occurence of tokens")
+        # Build counts matrix over positions across all samples
+        logger.info("Building position-counts matrix across samples")
+        # Convert input_ids to a NumPy array: (n_samples, seq_len)
+        ids_list = self.dataset['input_ids']
+        id_mat = np.array(ids_list, dtype=np.int32)
+        unique_arr = np.array(unique_tids, dtype=np.int32)
         counts = np.zeros((len(unique_tids), self.seq_len), dtype=np.float32)
-        for i, tid in tqdm(enumerate(unique_tids)):
-            positions = [pos for pos, v in enumerate(self.dataset['input_ids'][0]) if v == tid]
-            # Here, counts row i gets 1 for each observed position
-            for pos_list in positions:
-                counts[i, pos_list] += 1.0
+        max_id = int(id_mat.max()) + 1
+        for p in tqdm(range(self.seq_len), desc="Counting positions per column"):
+            col = id_mat[:, p]  # token IDs at position p for all samples
+            binc = np.bincount(col, minlength=max_id)
+            counts[:, p] = binc[unique_arr]
 
-        # Vectorized aggregation: average attention across positions
+        # Vectorized aggregation: average attention across positions: average attention across positions
         logger.info("Aggregating attention matrix via matmul")
         N = counts @ W @ counts.T
         norms = counts.sum(axis=1)
@@ -326,7 +330,6 @@ class GeneRegulatoryNetwork:
             G.add_edge(src, tgt, weight=w)
         self.graph = G
         logger.info(f"Graph built: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges.")    
-
     def save_edge_list(
         self, 
         output_path: str,

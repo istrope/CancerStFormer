@@ -6,7 +6,7 @@ GenericClassifier: A flexible classification utility for tokenized datasets.
 
 This module defines the GenericClassifier class, which provides methods to:
   - Prepare a tokenized dataset for classification based on a metadata column.
-  - Split a single dataset into train/validation/test sets (with optional stratification).
+  - Split a single dataset into train/validation/test sets
   - Train a Hugging Face Transformer model for sequence classification.
   - Optionally tune hyperparameters with Ray Tune.
   - Evaluate the trained model.
@@ -23,7 +23,6 @@ Example usage:
         dataset_path="tmp/cells_labeled.dataset",
         output_directory="models/cells_model",
         test_size=0.2,
-        stratify=True
     )
 
     # Provide separate train & eval datasets:
@@ -45,7 +44,6 @@ Example usage:
         output_directory="models/tuned",
         n_trials=10,
         test_size=0.2,
-        stratify=True
     )
 """
 import os
@@ -59,7 +57,8 @@ from transformers import (
     TrainingArguments,
     DataCollatorWithPadding,
     AutoTokenizer,
-    BertForSequenceClassification
+    AutoConfig,
+    AutoModelForSequenceClassification
 )
 
 import stFormer.classifier.classifier_utils as cu
@@ -90,7 +89,7 @@ class GenericClassifier:
         max_examples_per_class=None,
         training_args={
             'per_device_train_batch_size': 32,
-            'evaluation_strategy': 'steps',
+            'eval_strategy': 'steps',
             'eval_steps': 100,
             'logging_steps': 1000,
             'save_steps': 1000,
@@ -156,6 +155,7 @@ class GenericClassifier:
         data.save_to_disk(str(ds_path))
         logger.info("Data prep complete.")
         return str(ds_path), str(map_path)
+    
 
     def train(
         self,
@@ -164,13 +164,11 @@ class GenericClassifier:
         output_directory,
         eval_dataset_path=None,
         n_trials: int = 0,
-        test_size: float = 0.2,
-        stratify: bool = False
+        test_size: float = 0.2
     ):
         """
         Train or tune a classifier.
         If eval_dataset_path is None, auto-split dataset_path using test_size.
-        Use stratification on the integer 'label' column if stratify=True.
         """
         # Ray Tune path
         if self.ray_config and n_trials > 0:
@@ -180,22 +178,15 @@ class GenericClassifier:
                 output_directory,
                 eval_dataset_path,
                 n_trials,
-                test_size,
-                stratify
+                test_size
             )
-
+        split_args = { 'test_size': test_size, 'seed': 42 }
         # Load primary dataset
         train_ds = load_from_disk(dataset_path)
         # Auto-split if no separate eval dataset
         if eval_dataset_path:
             eval_ds = load_from_disk(eval_dataset_path)
         else:
-            # Ensure 'label' is ClassLabel for stratification
-            if stratify:
-                train_ds = train_ds.class_encode_column('label')
-            split_args = { 'test_size': test_size, 'seed': 42 }
-            if stratify:
-                split_args['stratify_by_column'] = 'label'
             ds = train_ds.train_test_split(**split_args)
             train_ds = ds['train']
             eval_ds = ds['test']
@@ -210,13 +201,25 @@ class GenericClassifier:
         )
         args = TrainingArguments(output_dir=output_directory, **self.training_args)
         args.per_device_eval_batch_size = self.forward_batch_size
+        args.fp16=True
+        args.dataloader_num_workers = self.nproc
+        args.dataloader_pin_memory = True
+        args.gradient_checkpointing = True
+
 
         # Model init
-        model = BertForSequenceClassification.from_pretrained(
+        config = AutoConfig.from_pretrained(
             model_checkpoint,
-            local_files_only=True,
-            num_labels=len(self.label_mapping)
+            num_labels=len(self.label_mapping),           # override the final head size to match our sequence (different classification task)
         )
+        model = AutoModelForSequenceClassification.from_pretrained(
+            model_checkpoint,
+            config=config,
+            local_files_only=True,
+            ignore_mismatched_sizes=True                # if you're replacing an old head
+        )
+        model.to("cuda:0")
+
         if self.freeze_layers > 0 and hasattr(model, 'bert'):
             for l in model.bert.encoder.layer[:self.freeze_layers]:
                 for p in l.parameters(): p.requires_grad=False
@@ -245,8 +248,7 @@ class GenericClassifier:
         output_directory,
         eval_dataset_path,
         n_trials,
-        test_size,
-        stratify
+        test_size
     ):
         import os
         from pathlib import Path
@@ -288,15 +290,11 @@ class GenericClassifier:
         ray.init(ignore_reinit_error=True)
 
         # ─── Load & split data ──────────────────────────────────────────────────
+        split_args = { 'test_size': test_size, 'seed': 42 }
         train_ds = load_from_disk(dataset_path)
         if eval_dataset_path:
             eval_ds = load_from_disk(eval_dataset_path)
         else:
-            if stratify:
-                train_ds = train_ds.class_encode_column("labels")
-            split_args = {"test_size": test_size, "seed": 42}
-            if stratify:
-                split_args["stratify_by_column"] = "labels"
             ds = train_ds.train_test_split(**split_args)
             train_ds, eval_ds = ds["train"], ds["test"]
 
@@ -318,12 +316,15 @@ class GenericClassifier:
 
         # ─── Model init function ────────────────────────────────────────────────
         def model_init():
-            model = BertForSequenceClassification.from_pretrained(
+            config = AutoConfig.from_pretrained(
                 model_checkpoint,
-                num_labels=len(self.label_mapping),
-                output_attentions=False,
-                output_hidden_states=False,
-                local_files_only=local_files_only
+                num_labels=len(self.label_mapping),  # override the final head size to match our sequence (different classification task)
+            )
+            model = AutoModelForSequenceClassification.from_pretrained(
+                model_checkpoint,
+                config=config,
+                local_files_only=True,
+                ignore_mismatched_sizes=True # if you're replacing an old head
             )
             if self.freeze_layers:
                 for layer in model.bert.encoder.layer[: self.freeze_layers]:
@@ -356,7 +357,7 @@ class GenericClassifier:
         base_args = dict(self.training_args)
         base_args.update({
             "output_dir": output_directory,
-            "evaluation_strategy": "steps",
+            "eval_strategy": "steps",
             "save_strategy": "steps",
             "eval_steps": base_args.get("logging_steps", 500),
             "save_steps": base_args.get("logging_steps", 500),
@@ -432,7 +433,7 @@ class GenericClassifier:
         args = TrainingArguments(
             output_dir=output_directory,
             per_device_eval_batch_size=self.forward_batch_size,
-            evaluation_strategy='no'
+            eval_strategy='no'
         )
         trainer = Trainer(
             model=model,
