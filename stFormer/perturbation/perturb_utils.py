@@ -17,7 +17,6 @@ from transformers import (
 )
 
 sns.set()
-
 logger = logging.getLogger(__name__)
 
 
@@ -199,6 +198,98 @@ def overexpress_indices(example):
     example["length"] = len(example["input_ids"])
     return example
 
+def check_batch_inputs(orig_batch,pert_batch,start,end,perturb_type,):
+    for i in range(len(orig_batch["input_ids"])):
+        orig_tokens = orig_batch["input_ids"][i]
+        pert_tokens = pert_batch["input_ids"][i]
+
+        # Either full match or (for delete perturbations) perturbed should be a subset
+        if perturb_type == "delete":
+            if not set(pert_tokens).issubset(set(orig_tokens)):
+                print(f"Mismatch in DELETE at index {start + i}")
+                print("Original:", orig_tokens)
+                print("Perturbed:", pert_tokens)
+                raise ValueError("Perturbed tokens are not a subset of original tokens.")
+        else:  # Overexpress
+            # Overexpress should preserve the original tokens somewhere after the perturb
+            missing = [t for t in orig_tokens if t not in pert_tokens]
+            if missing:
+                print(f"Mismatch in OVEREXPRESS at index {start + i}")
+                print("Original:", orig_tokens)
+                print("Perturbed:", pert_tokens)
+                print("Missing tokens from perturbed:", missing)
+                raise ValueError("Original tokens missing from perturbed batch.")
+            
+def check_embedding_shapes(pert_emb,original_emb,orig_batch,pert_batch,start,end):
+    if pert_emb.shape[1] != original_emb.shape[1]:
+        print("---- Shape mismatch detected ----")
+        print(f"pert_emb shape: {pert_emb.shape}")
+        print(f"original_emb shape: {original_emb.shape}")
+        print(f"Batch indices {start} to {end}")
+        print(f"Original lengths: {orig_batch['length']}")
+        print(f"Perturbed lengths: {pert_batch['length']}")
+        for i in range(len(orig_batch["input_ids"])):
+            print(f"Sample {i} orig tokens ({len(orig_batch['input_ids'][i])}): {orig_batch['input_ids'][i]}")
+            print(f"Sample {i} pert tokens ({len(pert_batch['input_ids'][i])}): {pert_batch['input_ids'][i]}")
+        raise ValueError("Embedding dimensions do not match. Aborting.")
+
+def align_perturbed_embeddings(full_pert, orig_batch, pert_batch, tokens_to_perturb):
+    """
+    Align perturbed embeddings to original embeddings by removing the first occurrence 
+    of each overexpressed token, if sequence length increased. Pads to batch max length.
+    """
+    aligned_pert_emb = []
+
+    for i in range(full_pert.shape[0]):
+        orig_tokens = orig_batch["input_ids"][i]
+        pert_tokens = pert_batch["input_ids"][i]
+        pert_emb_sample = full_pert[i]
+
+        orig_len = orig_batch["length"][i]
+        pert_len = pert_batch["length"][i]
+
+        pert_tokens_mod = list(pert_tokens)  # Explicitly create new list
+
+        length_increase = pert_len - orig_len
+
+        removed = 0
+        for token in tokens_to_perturb:
+            if length_increase > 0 and token in pert_tokens_mod:
+                index_to_remove = pert_tokens_mod.index(token)
+
+                # Sanity check before removal
+                if index_to_remove >= pert_emb_sample.shape[0]:
+                    raise ValueError(
+                        f"Sample {i}: Token index {index_to_remove} exceeds embedding length {pert_emb_sample.shape[0]}"
+                    )
+
+                pert_tokens_mod.pop(index_to_remove)
+                pert_emb_sample = torch.cat((
+                    pert_emb_sample[:index_to_remove, :],
+                    pert_emb_sample[index_to_remove+1:, :]
+                ), dim=0)
+
+                length_increase -= 1
+                removed += 1
+
+        # Sanity check after all removals
+        if len(pert_tokens_mod) != pert_emb_sample.shape[0]:
+            raise ValueError(
+                f"Sample {i}: Token list length {len(pert_tokens_mod)} does not match embedding length {pert_emb_sample.shape[0]}"
+            )
+
+        # Truncate or pad to match original length
+        if len(pert_tokens_mod) > orig_len:
+            pert_emb_sample = pert_emb_sample[:orig_len, :]
+        elif len(pert_tokens_mod) < orig_len:
+            pad_size = orig_len - len(pert_tokens_mod)
+            padding = pert_emb_sample.new_zeros((pad_size, pert_emb_sample.shape[1]))
+            pert_emb_sample = torch.cat([pert_emb_sample, padding], dim=0)
+
+        aligned_pert_emb.append(pert_emb_sample)
+
+    return torch.stack(aligned_pert_emb)
+
 
 # for genes_to_perturb = list of genes to overexpress that are not necessarily expressed in cell
 def overexpress_tokens(example, max_len):
@@ -216,7 +307,6 @@ def overexpress_tokens(example, max_len):
 
     example["length"] = len(example["input_ids"])
     return example
-
 
 def calc_n_overflow(max_len, example_len, tokens_to_perturb, indices_to_perturb):
     n_to_add = len(tokens_to_perturb) - len(indices_to_perturb)
@@ -681,19 +771,24 @@ def validate_cell_states_to_model(cell_states_to_model):
             raise
 
 class GeneIdHandler:
-    def __init__(self, raise_errors=False):
+    def __init__(
+            self, 
+            raise_errors=False,
+            token_dictionary_file = None,
+            gene_id_name_dict = None):
+        
         def invert_dict(dict_obj):
             return {v:k for k,v in dict_obj.items()}
         
         self.raise_errors = raise_errors
         
-        with open(TOKEN_DICTIONARY_FILE, 'rb') as f:
+        with open(token_dictionary_file, 'rb') as f:
             self.gene_token_dict = pickle.load(f)
             self.token_gene_dict = invert_dict(self.gene_token_dict)
 
-        with open(ENSEMBL_DICTIONARY_FILE, 'rb') as f:
-            self.id_gene_dict = pickle.load(f)
-            self.gene_id_dict = invert_dict(self.id_gene_dict)
+        with open(gene_id_name_dict, 'rb') as f:
+            self.gene_id_dict = pickle.load(f)
+            self.id_gene_dict = invert_dict(self.id_gene_dict)
             
     def ens_to_token(self, ens_id):
         if not self.raise_errors:

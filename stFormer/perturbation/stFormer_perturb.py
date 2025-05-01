@@ -36,9 +36,8 @@ from datasets import Dataset
 from datasets.utils.logging import disable_progress_bar
 from tqdm.auto import trange
 
-#from geneformer_perturber_utils import perturber_utils as pu
-import stFormer.perturbation.utils as pu
-from stFormer.perturbation.embs import get_embs, label_cell_embs, label_gene_embs
+import stFormer.perturbation.perturb_utils as pu
+from stFormer.perturbation.embs import get_embs
 disable_progress_bar()
 
 logger = logging.getLogger(__name__)
@@ -399,18 +398,26 @@ class InSilicoPerturber:
 
         return filtered_input_data
 
+
     def isp_perturb_set(self, model, dataset: Dataset, layer_to_quant: int, prefix: str):
         """
-        Perform in‐silico group perturbations on `dataset`, compute cosine similarities,
-        and write results to disk under `prefix`.
+        Perform in-silico group perturbations on dataset, compute cosine similarities,
+        and write results to disk under prefix.
         """
+        import torch
+        from torch.utils.data import DataLoader
+        from torch.nn.utils.rnn import pad_sequence
+        from collections import defaultdict
+        from tqdm import tqdm
+
+        #  INNER FUNCTIONS 
+
         def batch_fn(example):
             ids = example["input_ids"]
             example["tokens_to_perturb"] = self.tokens_to_perturb
-            # find indices of each token (or mark as absent)
             idxs = [ids.index(t) for t in self.tokens_to_perturb if t in ids]
             example["perturb_index"] = idxs or [-100]
-            # apply the actual perturbation
+
             if self.perturb_type == "delete":
                 example = pu.delete_indices(example)
             else:  # overexpress
@@ -420,29 +427,68 @@ class InSilicoPerturber:
                 )
             return example
 
-        total = len(dataset)
-        if self.cell_states_to_model is None:
-            cos_sims = defaultdict(list)
-        else:
-            cos_sims = {
-                st: defaultdict(list)
-                for st in pu.get_possible_states(self.cell_states_to_model)
+        def padding_collate_fn_orig(batch):
+            input_ids = [torch.tensor(sample["input_ids"]) for sample in batch]
+            lengths = torch.tensor([len(ids) for ids in input_ids])
+            padded_input_ids = pad_sequence(input_ids, batch_first=True, padding_value=0)
+
+            return {
+                "input_ids": padded_input_ids,
+                "lengths": lengths
             }
 
+        def padding_collate_fn_pert(batch):
+            input_ids = [torch.tensor(sample["input_ids"]) for sample in batch]
+            lengths = torch.tensor([len(ids) for ids in input_ids])
+            perturb_index = [sample["perturb_index"] for sample in batch]
+            padded_input_ids = pad_sequence(input_ids, batch_first=True, padding_value=0)
+
+            return {
+                "input_ids": padded_input_ids,
+                "lengths": lengths,
+                "perturb_index": perturb_index
+            }
+
+        #  PREPARE DATA 
+
+        total = len(dataset)
+
+        cos_sims = defaultdict(list)
+        gene_embs = defaultdict(list)
+
+        # Map perturbations
         perturbed = dataset.map(batch_fn, num_proc=self.nproc)
 
         if self.perturb_type == "overexpress":
             dataset = dataset.add_column("n_overflow", perturbed["n_overflow"])
             dataset = dataset.map(pu.truncate_by_n_overflow, num_proc=self.nproc)
 
-        if self.emb_mode == "cell_and_gene":
-            gene_embs = defaultdict(list)
+        # Create DataLoaders
+        orig_loader = DataLoader(
+            dataset,
+            batch_size=self.forward_batch_size,
+            shuffle=False,
+            collate_fn=padding_collate_fn_orig
+        )
 
-        for start in trange(0, total, self.forward_batch_size):
-            end = min(start + self.forward_batch_size, total)
-            orig_batch = dataset.select(range(start, end))
-            pert_batch = perturbed.select(range(start, end))
+        pert_loader = DataLoader(
+            perturbed,
+            batch_size=self.forward_batch_size,
+            shuffle=False,
+            collate_fn=padding_collate_fn_pert
+        )
 
+        #  MAIN LOOP 
+
+        for batch_num, (orig_batch, pert_batch) in enumerate(
+            tqdm(zip(orig_loader, pert_loader), total=len(orig_loader))
+        ):
+            #  Align batch lengths 
+            min_seq_len = min(orig_batch["input_ids"].shape[1], pert_batch["input_ids"].shape[1])
+            orig_batch["input_ids"] = orig_batch["input_ids"][:, :min_seq_len]
+            pert_batch["input_ids"] = pert_batch["input_ids"][:, :min_seq_len]
+
+            #  Embedding extraction 
             full_orig = get_embs(
                 model, orig_batch, "gene", layer_to_quant, self.pad_token_id,
                 self.forward_batch_size, token_gene_dict=self.token_gene_dict,
@@ -453,24 +499,19 @@ class InSilicoPerturber:
                 self.forward_batch_size, token_gene_dict=self.token_gene_dict,
                 summary_stat=None, silent=True
             )
+            #  Align embedding lengths 
+            min_emb_len = min(full_pert.shape[1], full_orig.shape[1])
+            full_pert = full_pert[:, :min_emb_len, :]
+            full_orig = full_orig[:, :min_emb_len, :]
 
-            idxs = pert_batch["perturb_index"]
-            original_emb = pu.remove_perturbed_indices_set(
-                full_orig, self.perturb_type, idxs,
-                self.tokens_to_perturb, orig_batch["length"]
-            )
-
-            if self.perturb_type == "overexpress":
-                pert_emb = full_pert[:, len(self.tokens_to_perturb):, :]
-            else:
-                pert_emb = full_pert[:, :max(orig_batch["length"]), :]
-
+            #  Gene-level cosine similarities 
             if self.cell_states_to_model is None or self.emb_mode == "cell_and_gene":
                 gene_cos = pu.quant_cos_sims(
-                    pert_emb, original_emb, self.cell_states_to_model,
+                    full_pert, full_orig, self.cell_states_to_model,
                     self.state_embs_dict, emb_mode="gene"
                 )
 
+            #  Cell-level cosine similarities 
             if self.cell_states_to_model is not None:
                 orig_cell = pu.mean_nonpadding_embs(
                     full_orig, torch.tensor(orig_batch["length"], device="cuda"), dim=1
@@ -483,24 +524,26 @@ class InSilicoPerturber:
                     self.state_embs_dict, emb_mode="cell"
                 )
 
+            #  Gene embedding dictionary update 
             if self.emb_mode == "cell_and_gene":
-                # truncate input_ids to those genes still present
-                n_genes = pert_emb.size(1)
+                n_genes = gene_cos.size(1)
                 genes_list = [
-                    [g for g in seq if g not in self.tokens_to_perturb][:n_genes]
+                    [g for g in seq.tolist() if g not in self.tokens_to_perturb][:n_genes]
                     for seq in orig_batch["input_ids"]
                 ]
                 for i, gene_seq in enumerate(genes_list):
                     for j, g in enumerate(gene_seq):
-                        key = tuple(self.tokens_to_perturb) if len(self.tokens_to_perturb) > 1 else self.tokens_to_perturb[0]
+                        key = (tuple(self.tokens_to_perturb)
+                            if len(self.tokens_to_perturb) > 1
+                            else self.tokens_to_perturb[0])
                         gene_embs[(key, g)].append(gene_cos[i, j].item())
 
+            #  Cosine similarity dictionary update 
             if self.cell_states_to_model is None:
-                # mean over remaining genes per cell
                 if self.perturb_type == "overexpress":
-                    nonpad = [l - len(self.tokens_to_perturb) for l in pert_batch["length"]]
+                    nonpad = [l - len(self.tokens_to_perturb) for l in pert_batch["lengths"]]
                 else:
-                    nonpad = pert_batch["length"]
+                    nonpad = pert_batch["lengths"]
                 cos_data = pu.mean_nonpadding_embs(
                     gene_cos, torch.tensor(nonpad, device="cuda")
                 )
@@ -512,9 +555,13 @@ class InSilicoPerturber:
                     cos_sims[state] = self.update_perturbation_dictionary(
                         cos_sims[state], sim_list, None, None, None
                     )
-            del orig_batch, pert_batch, full_orig, full_pert, original_emb, pert_emb
+
+            #  Memory cleanup 
+            del orig_batch, pert_batch, full_orig, full_pert
             torch.cuda.empty_cache()
-            
+
+        #  SAVE RESULTS 
+
         pu.write_perturbation_dictionary(
             cos_sims, f"{prefix}_cell_embs_dict_{self.tokens_to_perturb}"
         )
@@ -522,12 +569,28 @@ class InSilicoPerturber:
             pu.write_perturbation_dictionary(
                 gene_embs, f"{prefix}_gene_embs_dict_{self.tokens_to_perturb}"
             )
+
     def isp_perturb_all(self, model, dataset: Dataset, layer_to_quant: int, prefix: str):
         """
         Perturb each cell individually, compute cosine shifts, and write results in batches.
         """
-        # Initialize storage
+
+        import torch
+        from torch.utils.data import DataLoader
+        from torch.nn.utils.rnn import pad_sequence
+        from collections import defaultdict
+        from tqdm import trange
+
+        #  Collate function 
+        def padding_collate_fn_orig(batch):
+            input_ids = [torch.tensor(sample["input_ids"]) for sample in batch]
+            lengths = torch.tensor([len(ids) for ids in input_ids])
+            padded_input_ids = pad_sequence(input_ids, batch_first=True, padding_value=0)
+            return {"input_ids": padded_input_ids, "lengths": lengths}
+
+        #  Initialize storage 
         batch_idx = -1
+
         if self.cell_states_to_model is None:
             cos_sims = defaultdict(list)
         else:
@@ -535,69 +598,85 @@ class InSilicoPerturber:
                 st: defaultdict(list)
                 for st in pu.get_possible_states(self.cell_states_to_model)
             }
-        if self.emb_mode == "cell_and_gene":
-            gene_embs = defaultdict(list)
 
-        # Iterate over cells
+        gene_embs = defaultdict(list) if self.emb_mode == "cell_and_gene" else None
+
+        #  Iterate over cells 
         for i in trange(len(dataset), desc="Perturbing all cells"):
+
+            #  Original embedding 
             cell = dataset.select([i])
+            cell_batch = padding_collate_fn_orig(cell)
+
             full_orig = get_embs(
-                model, cell, "gene", layer_to_quant, self.pad_token_id,
+                model, cell_batch, "gene", layer_to_quant, self.pad_token_id,
                 self.forward_batch_size, token_gene_dict=self.token_gene_dict,
                 summary_stat=None, silent=True
             )
 
-            # Prepare gene list, dropping anchor if present
-            genes = cell["input_ids"][0][:]
-            if self.anchor_token:
-                for t in self.anchor_token:
-                    genes.remove(t)
+            genes = cell_batch["input_ids"][0][:].tolist()
 
-            # Build perturbation batch
+            #  Perturbation batch 
             pert_ds, idxs = pu.make_perturbation_batch(
                 cell, self.perturb_type, self.tokens_to_perturb,
                 self.anchor_token, self.combos, self.nproc
             )
+
+            pert_batch = padding_collate_fn_orig(pert_ds)
+
             full_pert = get_embs(
-                model, pert_ds, "gene", layer_to_quant, self.pad_token_id,
+                model, pert_batch, "gene", layer_to_quant, self.pad_token_id,
                 self.forward_batch_size, token_gene_dict=self.token_gene_dict,
                 summary_stat=None, silent=True
             )
 
-            # Slice out perturbed genes
+            #  Align embedding lengths 
+            min_len = min(full_orig.shape[1], full_pert.shape[1])
+            full_orig = full_orig[:, :min_len, :]
+            full_pert = full_pert[:, :min_len, :]
+
+            #  Slice out perturbed genes 
             n_pert = 1 + self.combos
             if self.perturb_type == "overexpress":
                 pert_emb = full_pert[:, n_pert:, :]
-                genes = genes[n_pert:]
+                genes = genes[n_pert:]  # remove overexpressed tokens
             else:
                 pert_emb = full_pert
 
-            # Build comparison batch and compute gene cosine sims
-            orig_batch = pu.make_comparison_batch(full_orig, idxs, perturb_group=False)
+            #  Comparison batch for cosine sims 
+            orig_batch = pu.make_comparison_batch(
+                full_orig, idxs, perturb_group=False
+            )
+
             gene_cos = pu.quant_cos_sims(
                 pert_emb, orig_batch, self.cell_states_to_model,
                 self.state_embs_dict, emb_mode="gene"
             )
 
-            # Compute cell cosine sims if modeling states
+            #  Cell-level similarity 
             if self.cell_states_to_model is not None:
-                orig_cell = pu.compute_nonpadded_cell_embedding(full_orig, "mean_pool")
-                pert_cell = pu.compute_nonpadded_cell_embedding(full_pert, "mean_pool")
+                orig_cell = pu.compute_nonpadded_cell_embedding(
+                    full_orig, "mean_pool"
+                )
+                pert_cell = pu.compute_nonpadded_cell_embedding(
+                    full_pert, "mean_pool"
+                )
                 cell_cos = pu.quant_cos_sims(
                     pert_cell, orig_cell, self.cell_states_to_model,
                     self.state_embs_dict, emb_mode="cell"
                 )
 
-            # Store gene‐embedding shifts if requested
+            #  Gene-level dictionary update 
             if self.emb_mode == "cell_and_gene":
-                # Map each perturbed gene to its affected genes
                 for p_i, p_gene in enumerate(genes):
                     affected = genes[:p_i] + genes[p_i+1:]
                     for a_gene, sim in zip(affected, gene_cos[p_i].tolist()):
-                        key = tuple(self.tokens_to_perturb) if len(self.tokens_to_perturb) > 1 else self.tokens_to_perturb[0]
+                        key = (tuple(self.tokens_to_perturb)
+                            if isinstance(self.tokens_to_perturb, (list, tuple))
+                            else self.tokens_to_perturb)
                         gene_embs[(p_gene, a_gene)].append(sim)
 
-            # Aggregate per‐cell or per‐state
+            #  Cosine similarity aggregation 
             if self.cell_states_to_model is None:
                 avg_shifts = torch.mean(gene_cos, dim=1)
                 cos_sims = self.update_perturbation_dictionary(
@@ -609,16 +688,18 @@ class InSilicoPerturber:
                         cos_sims[state], sims, None, None, genes
                     )
 
-            # Periodic writes
+            # Periodic save
             if i % 100 == 0:
                 pu.write_perturbation_dictionary(
                     cos_sims, f"{prefix}_dict_cell_embs_1Kbatch{batch_idx}"
                 )
-                if self.emb_mode == "cell_and_gene":
+                if gene_embs:
                     pu.write_perturbation_dictionary(
                         gene_embs, f"{prefix}_dict_gene_embs_1Kbatch{batch_idx}"
                     )
-            if i % 1000 == 0:
+
+            #  Rotate batch dictionaries 
+            if i % 1000 == 0 and i > 0:
                 batch_idx += 1
                 if self.cell_states_to_model is None:
                     cos_sims = defaultdict(list)
@@ -627,15 +708,18 @@ class InSilicoPerturber:
                         st: defaultdict(list)
                         for st in pu.get_possible_states(self.cell_states_to_model)
                     }
-                if self.emb_mode == "cell_and_gene":
+                if gene_embs is not None:
                     gene_embs = defaultdict(list)
                 torch.cuda.empty_cache()
 
-        # Final write
+            del cell_batch, pert_batch, full_orig, full_pert
+            torch.cuda.empty_cache()
+
+        #  Final write 
         pu.write_perturbation_dictionary(
             cos_sims, f"{prefix}_dict_cell_embs_1Kbatch{batch_idx}"
         )
-        if self.emb_mode == "cell_and_gene":
+        if gene_embs:
             pu.write_perturbation_dictionary(
                 gene_embs, f"{prefix}_dict_gene_embs_1Kbatch{batch_idx}"
             )

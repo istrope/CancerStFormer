@@ -24,9 +24,10 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import statsmodels.stats.multitest as smt
-from scipy.stats import ranksums
+from scipy.stats import mannwhitneyu
 from sklearn.mixture import GaussianMixture
-from tqdm.auto import tqdm, trange
+from tqdm.auto import trange
+from tqdm import tqdm
 
 from stFormer.perturbation.perturb_utils import flatten_list, validate_cell_states_to_model
 
@@ -273,165 +274,99 @@ def isp_aggregate_gene_shifts(
 def isp_stats_to_goal_state(
     cos_sims_df, result_dict, cell_states_to_model, genes_perturbed
 ):
-    if (
-        ("alt_states" not in cell_states_to_model.keys())
-        or (len(cell_states_to_model["alt_states"]) == 0)
-        or (cell_states_to_model["alt_states"] == [None])
-    ):
-        alt_end_state_exists = False
-    elif (len(cell_states_to_model["alt_states"]) > 0) and (
-        cell_states_to_model["alt_states"] != [None]
-    ):
-        alt_end_state_exists = True
 
-    # for single perturbation in multiple cells, there are no random perturbations to compare to
+    from collections import defaultdict
+    alt_states = cell_states_to_model.get("alt_states", [])
+    alt_states = [s for s in alt_states if s is not None]
+    alt_end_state_exists = len(alt_states) > 0
+
     if genes_perturbed != "all":
-        cos_sims_full_df = pd.DataFrame()
+        token = cos_sims_df.loc[0, "Gene"]
+        goal_vals = result_dict[cell_states_to_model["goal_state"]].get((token, "cell_emb"), [])
+        res = {
+            "Shift_to_goal_end": [np.mean(goal_vals) if goal_vals else np.nan]
+        }
+        if alt_end_state_exists:
+            for alt in alt_states:
+                vals = result_dict[alt].get((token, "cell_emb"), [])
+                res[f"Shift_to_alt_end_{alt}"] = [np.mean(vals) if vals else np.nan]
+        return pd.DataFrame(res)
 
-        cos_shift_data_end = []
-        token = cos_sims_df["Gene"][0]
-        cos_shift_data_end += result_dict[cell_states_to_model["goal_state"]].get(
-            (token, "cell_emb"), []
-        )
-        cos_sims_full_df["Shift_to_goal_end"] = [np.mean(cos_shift_data_end)]
-        if alt_end_state_exists is True:
-            for alt_state in cell_states_to_model["alt_states"]:
-                cos_shift_data_alt_state = []
-                cos_shift_data_alt_state += result_dict.get(alt_state).get(
-                    (token, "cell_emb"), []
-                )
-                cos_sims_full_df[f"Shift_to_alt_end_{alt_state}"] = [
-                    np.mean(cos_shift_data_alt_state)
-                ]
+    #### genes_perturbed == "all"
 
-        # sort by shift to desired state
-        cos_sims_full_df = cos_sims_full_df.sort_values(
-            by=["Shift_to_goal_end"], ascending=[False]
-        )
-        return cos_sims_full_df
+    #  PRELOAD RANDOM BACKGROUND LISTS
+    goal_random = []
+    alt_random = defaultdict(list)
 
-    elif genes_perturbed == "all":
-        goal_end_random_megalist = []
-        if alt_end_state_exists is True:
-            alt_end_state_random_dict = {
-                alt_state: [] for alt_state in cell_states_to_model["alt_states"]
-            }
-        for i in trange(cos_sims_df.shape[0]):
-            token = cos_sims_df["Gene"][i]
-            goal_end_random_megalist += result_dict[
-                cell_states_to_model["goal_state"]
-            ].get((token, "cell_emb"), [])
-            if alt_end_state_exists is True:
-                for alt_state in cell_states_to_model["alt_states"]:
-                    alt_end_state_random_dict[alt_state] += result_dict[alt_state].get(
-                        (token, "cell_emb"), []
-                    )
+    for i, token in enumerate(cos_sims_df["Gene"]):
+        goal_random.extend(result_dict[cell_states_to_model["goal_state"]].get((token, "cell_emb"), []))
+        if alt_end_state_exists:
+            for alt in alt_states:
+                alt_random[alt].extend(result_dict[alt].get((token, "cell_emb"), []))
 
-        # downsample to improve speed of ranksums
-        if len(goal_end_random_megalist) > 100_000:
-            random.seed(42)
-            goal_end_random_megalist = random.sample(
-                goal_end_random_megalist, k=100_000
+    cos_sims_df["N_Detections"] = [
+        len(result_dict[cell_states_to_model["goal_state"]].get((token, "cell_emb"), []))
+        for token in cos_sims_df["Gene"] 
+        ]
+    # Keep only genes with enough observations for reliable p-values
+    cos_sims_df = cos_sims_df[cos_sims_df["N_Detections"] >= 5].reset_index(drop=True)
+    # Downsample for speed
+    random.seed(42)
+    if len(goal_random) > 100_000:
+        goal_random = random.sample(goal_random, 100_000)
+    for alt in alt_states:
+        if len(alt_random[alt]) > 100_000:
+            alt_random[alt] = random.sample(alt_random[alt], 100_000)
+
+    # MAIN LOOP: COLLECT RESULTS INTO LIST
+    results = []
+    for i, row in tqdm(cos_sims_df.iterrows(),total=len(cos_sims_df),desc='Collecting Cosine Sims'):
+        token = row["Gene"]
+        name = row["Gene_name"]
+        ensembl = row["Ensembl_ID"]
+
+        vals_goal = result_dict[cell_states_to_model["goal_state"]].get((token, "cell_emb"), [])
+        mean_goal = np.mean(vals_goal) if vals_goal else np.nan
+        pval_goal = mannwhitneyu(goal_random, vals_goal).pvalue if vals_goal else 1.0
+
+        res = {
+            "Gene": token,
+            "Gene_name": name,
+            "Ensembl_ID": ensembl,
+            "Shift_to_goal_end": mean_goal,
+            "Goal_end_vs_random_pval": pval_goal,
+            "N_Detections": len(vals_goal),
+        }
+
+        if alt_end_state_exists:
+            for alt in alt_states:
+                vals_alt = result_dict[alt].get((token, "cell_emb"), [])
+                mean_alt = np.mean(vals_alt) if vals_alt else np.nan
+                pval_alt = mannwhitneyu(alt_random[alt], vals_alt).pvalue if vals_alt else 1.0
+                res[f"Shift_to_alt_end_{alt}"] = mean_alt
+                res[f"Alt_end_vs_random_pval_{alt}"] = pval_alt
+
+        results.append(res)
+
+    cos_sims_full_df = pd.DataFrame(results)
+
+    #  FDR CALCULATION (VECTORIZE) -
+    cos_sims_full_df["Goal_end_FDR"] = get_fdr(cos_sims_full_df["Goal_end_vs_random_pval"])
+    if alt_end_state_exists:
+        for alt in alt_states:
+            cos_sims_full_df[f"Alt_end_FDR_{alt}"] = get_fdr(
+                cos_sims_full_df[f"Alt_end_vs_random_pval_{alt}"]
             )
-        if alt_end_state_exists is True:
-            for alt_state in cell_states_to_model["alt_states"]:
-                if len(alt_end_state_random_dict[alt_state]) > 100_000:
-                    random.seed(42)
-                    alt_end_state_random_dict[alt_state] = random.sample(
-                        alt_end_state_random_dict[alt_state], k=100_000
-                    )
 
-        names = [
-            "Gene",
-            "Gene_name",
-            "Ensembl_ID",
-            "Shift_to_goal_end",
-            "Goal_end_vs_random_pval",
-        ]
-        if alt_end_state_exists is True:
-            [
-                names.append(f"Shift_to_alt_end_{alt_state}")
-                for alt_state in cell_states_to_model["alt_states"]
-            ]
-            names.append(names.pop(names.index("Goal_end_vs_random_pval")))
-            [
-                names.append(f"Alt_end_vs_random_pval_{alt_state}")
-                for alt_state in cell_states_to_model["alt_states"]
-            ]
-        cos_sims_full_df = pd.DataFrame(columns=names)
+    #  ADD SIG COLUMN & SORT
+    cos_sims_full_df["Sig"] = (cos_sims_full_df["Goal_end_FDR"] < 0.05).astype(int)
+    cos_sims_full_df = cos_sims_full_df.sort_values(
+        by=["Sig", "Shift_to_goal_end", "Goal_end_FDR"],
+        ascending=[False, False, True]
+    )
 
-        n_detections_dict = dict()
-        for i in trange(cos_sims_df.shape[0]):
-            token = cos_sims_df["Gene"][i]
-            name = cos_sims_df["Gene_name"][i]
-            ensembl_id = cos_sims_df["Ensembl_ID"][i]
-            goal_end_cos_sim_megalist = result_dict[
-                cell_states_to_model["goal_state"]
-            ].get((token, "cell_emb"), [])
-            n_detections_dict[token] = len(goal_end_cos_sim_megalist)
-            mean_goal_end = np.mean(goal_end_cos_sim_megalist)
-            pval_goal_end = ranksums(
-                goal_end_random_megalist, goal_end_cos_sim_megalist
-            ).pvalue
+    return cos_sims_full_df
 
-            if alt_end_state_exists is True:
-                alt_end_state_dict = {
-                    alt_state: [] for alt_state in cell_states_to_model["alt_states"]
-                }
-                for alt_state in cell_states_to_model["alt_states"]:
-                    alt_end_state_dict[alt_state] = result_dict[alt_state].get(
-                        (token, "cell_emb"), []
-                    )
-                    alt_end_state_dict[f"{alt_state}_mean"] = np.mean(
-                        alt_end_state_dict[alt_state]
-                    )
-                    alt_end_state_dict[f"{alt_state}_pval"] = ranksums(
-                        alt_end_state_random_dict[alt_state],
-                        alt_end_state_dict[alt_state],
-                    ).pvalue
-
-            results_dict = dict()
-            results_dict["Gene"] = token
-            results_dict["Gene_name"] = name
-            results_dict["Ensembl_ID"] = ensembl_id
-            results_dict["Shift_to_goal_end"] = mean_goal_end
-            results_dict["Goal_end_vs_random_pval"] = pval_goal_end
-            if alt_end_state_exists is True:
-                for alt_state in cell_states_to_model["alt_states"]:
-                    results_dict[f"Shift_to_alt_end_{alt_state}"] = alt_end_state_dict[
-                        f"{alt_state}_mean"
-                    ]
-                    results_dict[
-                        f"Alt_end_vs_random_pval_{alt_state}"
-                    ] = alt_end_state_dict[f"{alt_state}_pval"]
-
-            cos_sims_df_i = pd.DataFrame(results_dict, index=[i])
-            cos_sims_full_df = pd.concat([cos_sims_full_df, cos_sims_df_i])
-
-        cos_sims_full_df["Goal_end_FDR"] = get_fdr(
-            list(cos_sims_full_df["Goal_end_vs_random_pval"])
-        )
-        if alt_end_state_exists is True:
-            for alt_state in cell_states_to_model["alt_states"]:
-                cos_sims_full_df[f"Alt_end_FDR_{alt_state}"] = get_fdr(
-                    list(cos_sims_full_df[f"Alt_end_vs_random_pval_{alt_state}"])
-                )
-
-        # quantify number of detections of each gene
-        cos_sims_full_df["N_Detections"] = [
-            n_detections_dict[token] for token in cos_sims_full_df["Gene"]
-        ]
-
-        # sort by shift to desired state
-        cos_sims_full_df["Sig"] = [
-            1 if fdr < 0.05 else 0 for fdr in cos_sims_full_df["Goal_end_FDR"]
-        ]
-        cos_sims_full_df = cos_sims_full_df.sort_values(
-            by=["Sig", "Shift_to_goal_end", "Goal_end_FDR"],
-            ascending=[False, False, True],
-        )
-
-        return cos_sims_full_df
 
 
 # stats comparing cos sim shifts of test perturbations vs null distribution
@@ -468,7 +403,7 @@ def isp_stats_vs_null(cos_sims_df, dict_list, null_dict_list):
         cos_sims_full_df.loc[i, "Test_vs_null_avg_shift"] = np.mean(
             test_shifts
         ) - np.mean(null_shifts)
-        cos_sims_full_df.loc[i, "Test_vs_null_pval"] = ranksums(
+        cos_sims_full_df.loc[i, "Test_vs_null_pval"] = mannwhitneyu(
             test_shifts, null_shifts, nan_policy="omit"
         ).pvalue
         # remove nan values
