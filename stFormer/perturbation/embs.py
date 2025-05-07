@@ -40,7 +40,10 @@ def get_embs(
     silent=False,
 ):
     model_input_size = pu.get_model_input_size(model)
-    total_batch_length = filtered_input_data["input_ids"].shape[0]  # assume dict
+    if isinstance(filtered_input_data,dict):
+        total_batch_length = filtered_input_data["input_ids"].shape[0]
+    else: #dictionary input
+        total_batch_length = len(filtered_input_data)
     
     if summary_stat is None:
         embs_list = []
