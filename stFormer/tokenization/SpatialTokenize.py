@@ -245,11 +245,9 @@ def rank_genes(vec: np.ndarray, toks: np.ndarray) -> np.ndarray:
 def check_format(adata: ad.AnnData) -> Dict[str, object]:
     res = {'valid': True, 'messages': []}
     if 'ensembl_id' not in adata.var:
-        res['valid'] = False
-        res['messages'].append('Missing ensembl_id')
+        raise AttributeError('Missing ensembl_id column in var')
     if 'n_counts' not in adata.obs:
-        res['valid'] = False
-        res['messages'].append('Missing n_counts')
+        raise AttributeError('Missing n_counts in metadata')
     return res
 
 # -------------------- Spatial Tokenizer -------------------- #
@@ -311,9 +309,6 @@ class SpatialTokenizer:
         out_path = out_dir / f"{prefix}.dataset"
         ds.save_to_disk(str(out_path))
         logger.info(f'Saved → {out_path}')
-        #tok_dir = out_dir / f'{prefix}_tokenizer'
-        #self.tokenizer.save_pretrained(str(tok_dir))
-        #logger.info(f"Tokenizer saved → {tok_dir}")
 
     def _tokenize_ad(
         self,
@@ -325,8 +320,8 @@ class SpatialTokenizer:
             sel, _ = train_test_split(idxs, test_size=self.down_pct, random_state=self.down_seed)
             ad = ad[sel, :]
 
-        chk = check_format(ad)
-        logger.info(f'AnnData check: {chk}')
+        check_format(ad)
+        logger.info(f'Passed Anndata Check: n_counts and ensembl_id')
 
         var = ad.var['ensembl_id'] if 'ensembl_id' in ad.var else ad.var_names
         idxs = [i for i, g in enumerate(var) if g in self.genes]
@@ -380,7 +375,6 @@ class SpatialTokenizer:
             batches.append(Dataset.from_dict(sub))
         ds = concatenate_datasets(batches)
 
-        # compute length field
         ds = ds.map(lambda ex: {'length': len(ex['input_ids'])}, num_proc=self.nproc)
         return ds
 

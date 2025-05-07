@@ -9,8 +9,7 @@ import logging
 import random
 from collections import defaultdict, Counter
 
-import numpy as np
-import pandas as pd
+import pickle
 from datasets import load_from_disk
 
 
@@ -77,23 +76,76 @@ def flatten_list(l):
     """
     return [item for sublist in l for item in sublist]
 
-def label_classes(classifier, data, class_dict, nproc):
+def label_classes(classifier, data, class_dict, token_dict_path, nproc):
     """
-    Map class labels to numeric IDs. For cell classifiers, uses the "label" column.
-    For gene classifiers, processes "input_ids" into "labels".
-    Returns the modified dataset and a dictionary mapping original labels to IDs.
+    Map class labels to numeric IDs.
+    - For cell classifiers, uses the `label` column.
+    - For gene classifiers, loads the token dictionary so we can
+      map each input_ids token back to its ENSEMBL ID, and then
+      to your provided gene classes.
+    Returns (dataset, class_id_dict).
     """
     if classifier == "cell":
+        # unchanged from before
         label_set = set(data["label"])
         class_id_dict = {label: idx for idx, label in enumerate(sorted(label_set))}
-        data = data.map(lambda ex: {"label": class_id_dict[ex["label"]]}, num_proc=nproc)
+        data = data.map(
+            lambda ex: {"label": class_id_dict[ex["label"]]},
+            num_proc=nproc
+        )
+        return data, class_id_dict
+
     elif classifier == "gene":
-        class_id_dict = {k: idx for idx, k in enumerate(sorted(class_dict.keys()))}
-        def map_gene_labels(example):
-            example["labels"] = [class_id_dict.get(token, -100) for token in example["input_ids"]]
-            return example
-        data = data.map(map_gene_labels, num_proc=nproc)
-    return data, class_id_dict
+        # 1) build a class-name → integer map
+        class_id_dict = {name: i for i, name in enumerate(sorted(class_dict.keys()))}
+
+        # 2) load your vocab (ENSEMBL string → token ID) and invert it
+        with open(token_dict_path, "rb") as f:
+            gene2token = pickle.load(f)
+        token2gene = {v: k for k, v in gene2token.items()}
+
+        # 3) build token ID → class ID map
+        token2class = {}
+        for class_name, gene_list in class_dict.items():
+            cid = class_id_dict[class_name]
+            for gene in gene_list:
+                tid = gene2token.get(gene)
+                if tid is not None:
+                    token2class[tid] = cid
+
+        def map_gene_labels_batch(batch):
+            # batch["input_ids"] is a list of lists
+            all_labels = []
+            for seq in batch["input_ids"]:
+                # map each token to its class (or -100)
+                labels = [ token2class.get(int(t), -100) for t in seq ]
+                all_labels.append(labels)
+            batch["labels"] = all_labels
+            return batch
+
+
+        data = data.map(
+            map_gene_labels_batch, 
+            num_proc=nproc,
+            batched=True,
+            batch_size=1000
+            )
+
+        data = data.filter(
+            lambda ex: any(l != -100 for l in ex["labels"]),
+            num_proc=nproc
+        )
+
+        n_remaining = len(data)
+        if n_remaining == 0 :
+            raise ValueError(
+                'No gene-class examples remain after filtering; '
+                'review class_dict or token dictionary for this discrepency'
+            )
+        return data, class_id_dict
+
+    else:
+        raise ValueError(f"Unknown classifier type: {classifier}")
 
 
 import torch
@@ -112,15 +164,53 @@ class DataCollatorForCellClassification(DataCollatorWithPadding):
         }
         return batch
 
-class DataCollatorForGeneClassification(DataCollatorWithPadding):
+import torch
+from transformers import DataCollatorWithPadding
+_tf_tokenizer_logger = logging.getLogger("transformers.tokenization_utils_base")
+
+class DataCollatorForGeneClassification:
     """
-    A data collator for gene classification that pads input_ids and collates sequence labels.
+    Pads input_ids, attention_mask, and per-token labels for gene classification.
+    - Uses tokenizer.pad() to handle all special tokens and masks.
+    - Pads labels to the same length with label_pad_token_id (-100).
     """
+    def __init__(
+        self,
+        tokenizer,
+        padding="longest",          # or 'max_length'
+        max_length=None,            # e.g. tokenizer.model_max_length
+        label_pad_token_id=-100,
+        return_tensors="pt"
+    ):
+        self.tokenizer = tokenizer
+        self.padding = padding
+        self.max_length = max_length
+        self.label_pad_token_id = label_pad_token_id
+        self.return_tensors = return_tensors
+
     def __call__(self, features):
-        labels = [f["labels"] for f in features]
-        input_ids = [f["input_ids"] for f in features]
-        batch = {
-            "input_ids": torch.tensor(input_ids, dtype=torch.long),
-            "labels": torch.tensor(labels, dtype=torch.long)
-        }
+        raw_labels = [f.pop("labels") for f in features]
+        prev_level = _tf_tokenizer_logger.level
+        _tf_tokenizer_logger.setLevel(logging.ERROR)
+        batch = self.tokenizer.pad(
+            features,
+            padding=self.padding,
+            max_length=self.max_length,
+            return_tensors=self.return_tensors
+        )
+        _tf_tokenizer_logger.setLevel(prev_level)
+
+        labels = []
+        for lab in raw_labels:
+            if isinstance(lab, torch.Tensor):
+                lab = lab.tolist()
+            labels.append(lab)
+
+        seq_len = batch["input_ids"].shape[1]
+        padded_labels = [
+            lab + [self.label_pad_token_id] * (seq_len - len(lab))
+            for lab in labels
+        ]
+
+        batch["labels"] = torch.tensor(padded_labels, dtype=torch.long)
         return batch
