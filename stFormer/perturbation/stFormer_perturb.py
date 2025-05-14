@@ -414,8 +414,25 @@ class InSilicoPerturber:
 
         def batch_fn(example):
             ids = example["input_ids"]
+            toks = self.tokens_to_perturb
             example["tokens_to_perturb"] = self.tokens_to_perturb
-            idxs = [ids.index(t) for t in self.tokens_to_perturb if t in ids]
+            #idxs = [ids.index(t) for t in self.tokens_to_perturb if t in ids]
+            if self.mode == "spot":
+                # original logic: pick first hit (or multi-hit, up to you)
+                idxs = [ids.index(t) for t in toks if t in ids]
+            else:  # neighbor mode: require at least one in spot _and_ neighbor
+                spot_boundary = self.max_len
+                idxs = []
+                for t in toks:
+                    # all positions of this token
+                    pos = [i for i, x in enumerate(ids) if x == t]
+                    # split into spot (< boundary) and neighbor (>= boundary)
+                    spot_pos     = [i for i in pos if i < spot_boundary]
+                    neighbor_pos = [i for i in pos if i >= spot_boundary]
+                    # only keep if both regions contain the token
+                    if spot_pos and neighbor_pos:
+                        idxs.extend(pos)
+
             example["perturb_index"] = idxs or [-100]
 
             if self.perturb_type == "delete":

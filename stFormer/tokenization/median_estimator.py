@@ -239,8 +239,8 @@ class MedianEstimator:
         self.out_path.mkdir(parents=True,exist_ok=True)
         out_file = self.out_path / 'gene_medians.pickle'
         with open(out_file,'wb') as fp:
-            pickle.dump(out_file,self.medians)
-        logger.infor(f'Saved gene medians to {out_file}')
+            pickle.dump(self.medians,fp)
+        logger.info(f'Saved gene medians to {out_file}')
 
 
 
