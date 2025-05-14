@@ -249,6 +249,11 @@ def check_format(adata: ad.AnnData,file):
     if 'n_counts' not in adata.obs:
         raise ValueError('missing n_counts value from adata.var for file {file}')
 
+    if 'n_counts' not in adata.obs:
+        raise AttributeError('Missing n_counts in metadata')
+    return res
+
+
 #  Spatial Tokenizer  #
 class SpatialTokenizer:
     """
@@ -377,7 +382,6 @@ class SpatialTokenizer:
             batches.append(Dataset.from_dict(sub))
         ds = concatenate_datasets(batches)
 
-        # compute length field
         ds = ds.map(lambda ex: {'length': len(ex['input_ids'])}, num_proc=self.nproc)
         return ds
 

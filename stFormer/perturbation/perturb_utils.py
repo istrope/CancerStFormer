@@ -30,9 +30,7 @@ def load_and_filter(filter_data, nproc, input_data_file):
 
 def filter_by_dict(data, filter_data, nproc):
     for key, value in filter_data.items():
-        def filter_data_by_criteria(example):
-            return example[key] in value
-        data = data.filter(filter_data_by_criteria, num_proc=nproc)
+        data = data.filter(lambda example: example[key] in value, num_proc=nproc)
     if len(data) == 0:
         logger.error("No cells remain after filtering. Check filtering criteria.")
         raise
