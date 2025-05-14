@@ -251,7 +251,6 @@ def check_format(adata: ad.AnnData,file):
 
     if 'n_counts' not in adata.obs:
         raise AttributeError('Missing n_counts in metadata')
-    return res
 
 
 #  Spatial Tokenizer  #
