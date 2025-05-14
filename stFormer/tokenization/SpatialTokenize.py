@@ -91,7 +91,7 @@ from transformers import PreTrainedTokenizerFast
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# -------------------- Median Estimation -------------------- #
+#  Median Estimation 
 class MedianEstimator:
     """
     Stream through .loom or chunk through .h5ad to update per-gene T‑Digests.
@@ -155,7 +155,7 @@ class MedianEstimator:
             else:
                 self.tdigests[g] = td
 
-# -------------------- Merge Utility -------------------- #
+#  Merge Utility  #
 def merge_tdigest_dicts(directory: Path, pattern: str = '*.pickle') -> Dict[str, crick.tdigest.TDigest]:
     merged: Dict[str, crick.tdigest.TDigest] = {}
     for f in directory.glob(pattern):
@@ -168,7 +168,7 @@ def merge_tdigest_dicts(directory: Path, pattern: str = '*.pickle') -> Dict[str,
                 merged[g] = td
     return merged
 
-# -------------------- Token Dictionary -------------------- #
+#  Token Dictionary 
 def create_token_dictionary(median_dict: Dict[str, float], reserved: Optional[Dict[str, int]] = None) -> Dict[str, int]:
     if reserved is None:
         reserved = {'<pad>': 0, '<mask>': 1}
@@ -213,16 +213,16 @@ def build_custom_tokenizer(
         cls_token='<cls>',
         sep_token="<sep>"
     )
-# -------------------- Tokenization Helpers -------------------- #
+#  Tokenization Helpers 
 def ensure_graph(adata: ad.AnnData, key: str = 'spatial') -> None:
     # if there's already a nontrivial connectivity, leave it alone
     if 'spatial_connectivities' in adata.obsp and adata.obsp['spatial_connectivities'].nnz > 0:
         return
-
-    coords = adata.obsm[key]
-    if coords is None:
+    
+    if key not in adata.obsm:
         raise KeyError(f'Missing spatial coords at adata.obsm["{key}"]')
-
+    
+    coords = adata.obsm[key]
     # build Delaunay graph
     tri = Delaunay(coords)
     n = coords.shape[0]
@@ -242,17 +242,14 @@ def rank_genes(vec: np.ndarray, toks: np.ndarray) -> np.ndarray:
     idx = np.argsort(-vec)
     return toks[idx]
 
-def check_format(adata: ad.AnnData) -> Dict[str, object]:
-    res = {'valid': True, 'messages': []}
+def check_format(adata: ad.AnnData,file):
     if 'ensembl_id' not in adata.var:
-        res['valid'] = False
-        res['messages'].append('Missing ensembl_id')
+        raise ValueError('ensembl_id not in adata.var for file {file}, ' \
+        'please rename ensembl column or convert names ensembl')
     if 'n_counts' not in adata.obs:
-        res['valid'] = False
-        res['messages'].append('Missing n_counts')
-    return res
+        raise ValueError('missing n_counts value from adata.var for file {file}')
 
-# -------------------- Spatial Tokenizer -------------------- #
+#  Spatial Tokenizer  #
 class SpatialTokenizer:
     """
     Tokenize in 'spot' or 'neighborhood' modes:
@@ -298,9 +295,11 @@ class SpatialTokenizer:
         paths = list(data_dir.glob(f'*.{file_format}'))
         cells_all, nei_all, meta_all = [], [], {v: [] for v in self.meta_map.values()}
 
-        for p in paths:
+        for p in tqdm(paths,desc='Tokenizing Anndata',total=len(paths)):
+            self.path = p
             ad = sc.read_h5ad(str(p)) if file_format == 'h5ad' else sc.read_loom(str(p), sparse=True)
-            ensure_graph(ad)
+            if self.mode == 'neighborhood':
+                ensure_graph(ad)
             c, n, m = self._tokenize_ad(ad)
             cells_all += c
             nei_all += n
@@ -311,9 +310,6 @@ class SpatialTokenizer:
         out_path = out_dir / f"{prefix}.dataset"
         ds.save_to_disk(str(out_path))
         logger.info(f'Saved → {out_path}')
-        #tok_dir = out_dir / f'{prefix}_tokenizer'
-        #self.tokenizer.save_pretrained(str(tok_dir))
-        #logger.info(f"Tokenizer saved → {tok_dir}")
 
     def _tokenize_ad(
         self,
@@ -325,14 +321,14 @@ class SpatialTokenizer:
             sel, _ = train_test_split(idxs, test_size=self.down_pct, random_state=self.down_seed)
             ad = ad[sel, :]
 
-        chk = check_format(ad)
-        logger.info(f'AnnData check: {chk}')
+        check_format(ad,self.path)
 
         var = ad.var['ensembl_id'] if 'ensembl_id' in ad.var else ad.var_names
         idxs = [i for i, g in enumerate(var) if g in self.genes]
-        tokens = np.array([self.tok[var[i]] for i in idxs])
-        norms = np.array([self.med[var[i]] for i in idxs])
-        A = ad.obsp['spatial_connectivities']
+        tokens = np.array([self.tok[var.iloc[i]] for i in idxs])
+        norms = np.array([self.med[var.iloc[i]] for i in idxs])
+        if self.mode == 'neighborhood':
+            A = ad.obsp['spatial_connectivities']
         meta = {ik: ad.obs[ik].tolist() for ik in self.meta_map}
 
         # pre-load full gene matrix
@@ -346,7 +342,8 @@ class SpatialTokenizer:
             ncnt = ad.obs['n_counts'].values[batch][:, None]
 
             spot = (X_spot / ncnt * self.target) / norms
-            nei_mat = (A[batch, :].dot(full_X) / ncnt * self.target) / norms
+            if self.mode == 'neighborhood':
+                nei_mat = (A[batch, :].dot(full_X) / ncnt * self.target) / norms
 
             for i, r in enumerate(spot):
                 spot_tokens = rank_genes(r[r > 0], tokens[r > 0])[:self.gene_length]

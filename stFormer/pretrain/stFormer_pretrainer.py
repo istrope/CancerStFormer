@@ -118,26 +118,26 @@ def run_pretraining(
     """
     setup_environment(seed)
 
-    # --- load data & token dict ---
+    #  load data & token dict 
     train_ds = load_from_disk(dataset_path)
     token_dict = pickle.load(open(token_dict_path, 'rb'))
     pad_id     = token_dict['<pad>']
     vocab_size = len(token_dict)
 
-    # --- name & dirs ---
+    #  name & dirs 
     tz   = pytz.timezone('US/Central')
     now  = datetime.datetime.now(tz)
     stamp = now.strftime('%y%m%d_%H%M%S')
     run_name = f"{stamp}_stFormer_L{num_layers}_E{epochs}"
     dirs = make_output_dirs(Path(rootdir), run_name)
 
-    # --- config & model ---
+    #  config & model 
     config = build_bert_config(
         num_layers, num_heads, embed_dim, max_input, pad_id, vocab_size
     )
     model = BertForMaskedLM(config)
 
-    # --- training args ---
+    #  training args 
     save_steps = max(1, len(train_ds) // (batch_size * 8))
     training_args = TrainingArguments(
         output_dir=str(dirs['training']),
@@ -156,7 +156,7 @@ def run_pretraining(
     print(f"\n[INFO] Checkpoints will go to: {dirs['training']}")
     print(f"[INFO] TensorBoard logs will go to: {dirs['logging']}\n")
 
-    # --- trainer & train ---
+    #  trainer & train 
     trainer = STFormerPretrainer(
         model=model,
         args=training_args,
@@ -166,7 +166,7 @@ def run_pretraining(
     )
     trainer.train()
 
-    # --- save the final frozen model ---
+    #  save the final frozen model 
     final_dir = dirs['model']
     print(f"\n[INFO] Saving final model to: {final_dir}\n")
     trainer.model.save_pretrained(final_dir)
