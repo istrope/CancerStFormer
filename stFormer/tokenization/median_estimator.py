@@ -232,7 +232,7 @@ class MedianEstimator:
             for f, ds in self.datasets.items():
                 out_file = self.out_path / f'{f.stem}_tdigests.pickle'
                 with open(out_file, 'wb') as fp:
-                    pickle.dump(td_dict, fp)
+                    pickle.dump(ds, fp)
                 logger.info(f"Saved T-Digests to {out_file}")
 
     def write_medians(self):
