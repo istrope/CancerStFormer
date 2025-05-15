@@ -87,6 +87,8 @@ from tqdm import tqdm
 import crick.tdigest
 from tokenizers import Tokenizer, models, pre_tokenizers, decoders
 from transformers import PreTrainedTokenizerFast
+from numba import njit, prange, set_num_threads, get_num_threads
+import torch
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -238,22 +240,41 @@ def ensure_graph(adata: ad.AnnData, key: str = 'spatial') -> None:
     logger.info(f'Delaunay graph built; nnz = {adata.obsp["spatial_connectivities"].nnz}')
 
 
-def rank_genes(vec: np.ndarray, toks: np.ndarray) -> np.ndarray:
-    idx = np.argsort(-vec)
-    return toks[idx]
+def rank_genes_vectorized(expr_matrix: np.ndarray,
+                          token_array: np.ndarray,
+                          top_k: int):
+    """
+    expr_matrix: shape (batch_size, n_genes), already normalized
+    token_array: shape (n_genes,)
+    returns: array of shape (batch_size, top_k) of token IDs
+    """
+    n_cells,n_genes = expr_matrix.shape
+    if n_genes <= top_k:
+        idx_sorted = np.argsort(-expr_matrix,axis=1)
+        return(token_array[idx_sorted])
+    # find the top_k gene‐indices *unsorted* per row
+    idx_part = np.argpartition(-expr_matrix, top_k, axis=1)[:, :top_k]
+    
+    # gather their expression values
+    row_idx = np.arange(expr_matrix.shape[0])[:, None]
+    top_vals = expr_matrix[row_idx, idx_part]
+    
+    # now sort within each row by descending value
+    order = np.argsort(-top_vals, axis=1)
+    sorted_idx = idx_part[row_idx, order]
+    
+    # map back to tokens
+    return token_array[sorted_idx]
 
-def check_format(adata: ad.AnnData,file):
+
+def check_format(adata: ad.AnnData):
     if 'ensembl_id' not in adata.var:
         raise ValueError('ensembl_id not in adata.var for file {file}, ' \
         'please rename ensembl column or convert names ensembl')
     if 'n_counts' not in adata.obs:
         raise ValueError('missing n_counts value from adata.var for file {file}')
 
-    if 'n_counts' not in adata.obs:
-        raise AttributeError('Missing n_counts in metadata')
-
-
-#  Spatial Tokenizer  #
+#  Spatial Tokenizer  
 class SpatialTokenizer:
     """
     Tokenize in 'spot' or 'neighborhood' modes:
@@ -289,28 +310,35 @@ class SpatialTokenizer:
         self.genes = list(self.med.keys())
         #self.tokenizer = build_custom_tokenizer(token_dict_file)
 
+    def _process_file(self, path):
+        ad = sc.read_h5ad(str(path)) if str(path).endswith('.h5ad') \
+            else sc.read_loom(str(path))
+        if self.mode=="neighborhood":
+            ensure_graph(ad)
+        return self._tokenize_ad(ad)
+
     def tokenize(
         self,
         data_dir: Path,
         out_dir: Path,
         prefix: str,
-        file_format: Literal['h5ad', 'loom'] = 'h5ad',
     ) -> None:
-        paths = list(data_dir.glob(f'*.{file_format}'))
+        paths = list(data_dir.glob("*.h5ad")) + list(data_dir.glob("*.loom")) 
+        if not paths:
+            raise ValueError(f"No .h5ad/.loom files found in {data_dir!r}")
         cells_all, nei_all, meta_all = [], [], {v: [] for v in self.meta_map.values()}
 
-        for p in tqdm(paths,desc='Tokenizing Anndata',total=len(paths)):
-            self.path = p
-            ad = sc.read_h5ad(str(p)) if file_format == 'h5ad' else sc.read_loom(str(p), sparse=True)
-            if self.mode == 'neighborhood':
-                ensure_graph(ad)
-            c, n, m = self._tokenize_ad(ad)
-            cells_all += c
-            nei_all += n
+        def _handle_result(c, m):
+            cells_all.extend(c)
             for ik, ok in self.meta_map.items():
-                meta_all[ok] += m.get(ik, [])
+                meta_all[ok].extend(m.get(ik, []))
 
-        ds = self._make_ds(cells_all, nei_all, meta_all)
+        for p in tqdm(paths,desc = 'Tokenizing Anndata',total=len(paths)):
+            c,m = self._process_file(p)
+            _handle_result(c,m)
+        
+        logger.info('Making Hugging Face Dataset')
+        ds = self._make_ds(cells_all, meta_all)
         out_path = out_dir / f"{prefix}.dataset"
         ds.save_to_disk(str(out_path))
         logger.info(f'Saved → {out_path}')
@@ -325,62 +353,81 @@ class SpatialTokenizer:
             sel, _ = train_test_split(idxs, test_size=self.down_pct, random_state=self.down_seed)
             ad = ad[sel, :]
 
-        check_format(ad,self.path)
+        check_format(ad)
 
-        var = ad.var['ensembl_id'] if 'ensembl_id' in ad.var else ad.var_names
+       
+        var = ad.var['ensembl_id']
         idxs = [i for i, g in enumerate(var) if g in self.genes]
         tokens = np.array([self.tok[var.iloc[i]] for i in idxs])
         norms = np.array([self.med[var.iloc[i]] for i in idxs])
+
         if self.mode == 'neighborhood':
             A = ad.obsp['spatial_connectivities']
-        meta = {ik: ad.obs[ik].tolist() for ik in self.meta_map}
 
         # pre-load full gene matrix
         full_X = ad[:, idxs].X
         full_X = full_X.toarray() if sp.issparse(full_X) else full_X
 
-        c_out, n_out = [], []
-        for start in range(0, ad.n_obs, self.chunk):
-            batch = np.arange(start, min(start + self.chunk, ad.n_obs))
-            X_spot = full_X[batch, :]
-            ncnt = ad.obs['n_counts'].values[batch][:, None]
+        n_cells, n_genes = full_X.shape
+        ncnt      = ad.obs["n_counts"].values[:, None]     
+        c_out     = []
 
-            spot = (X_spot / ncnt * self.target) / norms
-            if self.mode == 'neighborhood':
-                nei_mat = (A[batch, :].dot(full_X) / ncnt * self.target) / norms
+        for start in range(0, n_cells, self.chunk):
+            end         = min(start + self.chunk, n_cells)
+            X_batch     = full_X[start:end, :]            
+            ncnt_batch  = ncnt[start:end, :]               
 
-            for i, r in enumerate(spot):
-                spot_tokens = rank_genes(r[r > 0], tokens[r > 0])[:self.gene_length]
-                if self.mode == 'spot':
-                    c_out.append(spot_tokens)
-                else:  # neighborhood
-                    mask = nei_mat[i] > 0
-                    nei_tokens = rank_genes(nei_mat[i][mask], tokens[mask])[:self.gene_length]
+            # 1) spot norm + ranking for this batch
+            spot_norm_batch = (X_batch / ncnt_batch * self.target) / norms
+
+            spot_tok_batch = rank_genes_vectorized(spot_norm_batch,tokens,self.gene_length)
+            if self.mode == "spot":
+                c_out.extend(spot_tok_batch.tolist())
+            else:
+                # 2) neighbor norm + ranking for this batch
+                A_batch        = A[start:end, :]         
+                nei_norm_batch = (A_batch.dot(full_X) / ncnt_batch * self.target) / norms
+                nei_tok_batch  = rank_genes_vectorized(nei_norm_batch,tokens,self.gene_length)
+                # 3) concatenate and append
+                combined = np.concatenate([spot_tok_batch, nei_tok_batch], axis=1)
+                c_out.extend(combined.tolist())
+        
+        meta = {
+            ik: ad.obs[ik].astype(str).values.tolist()
+            for ik in self.meta_map
+            }
 
 
-                    combined = np.concatenate([spot_tokens, nei_tokens])
-                    c_out.append(combined)
-
-        return c_out, n_out, meta
+        return c_out, meta
+            
+               
 
     def _make_ds(
         self,
         cells: List[np.ndarray],
-        nei: List[np.ndarray],
         meta: Dict[str, List],
     ) -> Dataset:
-        data: Dict[str, List] = {'input_ids': cells}
-        # add metadata columns, converting all values to strings for Arrow
-        for k, v in meta.items():
-            data[k] = [str(x) for x in v]
+        data = {
+            "input_ids": cells,
+            **{
+                k: [str(x) for x in v]    
+                for k, v in meta.items()
+            }
+        }
 
-        # batch into HF Datasets
-        batches, keys, vals = [], list(data.keys()), list(data.values())
-        for i in range(0, len(vals[0]), 10000):
-            sub = {k: v[i:i+10000] for k, v in zip(keys, vals)}
-            batches.append(Dataset.from_dict(sub))
-        ds = concatenate_datasets(batches)
+        ds = Dataset.from_dict(data)
 
-        ds = ds.map(lambda ex: {'length': len(ex['input_ids'])}, num_proc=self.nproc)
+        def add_length(batch):
+            # batch["input_ids"] is a list of lists
+            return {"length": [len(ids) for ids in batch["input_ids"]]}
+
+        ds = ds.map(
+            add_length,
+            batched=True,
+            batch_size=self.chunk,     
+            num_proc=self.nproc
+        )
+
         return ds
+
 
