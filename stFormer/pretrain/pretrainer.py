@@ -36,7 +36,7 @@ Example usage:
 import collections
 import pickle
 from pathlib import Path
-from typing import Dict, List, Optional, Union, Literal
+from typing import Dict, List, Optional, Union, Literal, Callable
 
 import numpy as np
 import torch
@@ -49,6 +49,7 @@ from transformers import (
     TrainingArguments,
 )
 from torch.utils.data import RandomSampler
+from transformers.trainer_utils import has_length
 from transformers.trainer_pt_utils import LengthGroupedSampler
 from transformers.utils import logging, to_py_obj
 
@@ -165,27 +166,39 @@ class STFormerPreCollator(SpecialTokensMixin):
         return mask0
 
 
+
 class STFormerPretrainer(Trainer):
     """
     Custom Trainer for masked pretraining on single-cell data.
     """
+
     def __init__(
         self,
-        model,
         args: TrainingArguments,
         train_dataset: Dataset,
         token_dictionary: Dict[str, int],
         example_lengths_file: Union[str, Path],
+        model: Optional[torch.nn.Module] = None,
+        model_init: Optional[Callable[[], torch.nn.Module]] = None,
         mlm_probability: float = 0.15,
     ):
+        if model is None and model_init is None:
+            raise ValueError("You must provide either `model` or `model_init`.")
+
+        self.lengths = load_example_lengths(example_lengths_file)
+
+        # Build custom tokenizer/collator
         collator = DataCollatorForLanguageModeling(
             tokenizer=STFormerPreCollator(token_dictionary),
             mlm=True,
             mlm_probability=mlm_probability,
         )
-        self.lengths = load_example_lengths(example_lengths_file)
+
+        # Store model or model_init
+        self._model_init = model_init 
         super().__init__(
             model=model,
+            model_init=model_init,
             args=args,
             train_dataset=train_dataset,
             data_collator=collator,
@@ -195,7 +208,7 @@ class STFormerPretrainer(Trainer):
         """
         Return a sampler, grouping by length if requested.
         """
-        if not hasattr(self.train_dataset, '__len__'):
+        if not has_length(self.train_dataset):
             return None
 
         if self.args.group_by_length:
@@ -206,3 +219,4 @@ class STFormerPretrainer(Trainer):
                 model_input_name=self.tokenizer.model_input_names[0],
             )
         return RandomSampler(self.train_dataset)
+

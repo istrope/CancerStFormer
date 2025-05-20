@@ -98,7 +98,9 @@ def get_training_arguments(
     do_eval: bool,
     length_column_name: str,
     disable_tqdm: bool,
-    overrides: Optional[Dict] = None
+    fp16: bool,
+    group_by_length: bool,
+    overrides: Optional[Dict] = None,
 ) -> TrainingArguments:
     """
     Build a TrainingArguments object, merging defaults with any overrides.
@@ -118,12 +120,13 @@ def get_training_arguments(
         'optim': optimizer_type,
         'do_train': do_train,
         'do_eval': do_eval,
-        'group_by_length': True,
         'length_column_name': length_column_name,
         'disable_tqdm': disable_tqdm,
         'save_strategy': 'steps',
         'save_steps': max(1, train_dataset_length // (batch_size * 8)),
         'logging_steps': 1000,
+        'fp16': fp16,
+        'group_by_length': group_by_length
     }
     if overrides:
         defaults.update(overrides)
@@ -152,7 +155,7 @@ class PretrainML:
             batch_size: int = 12,
             learning_rate: float = 1e-3,
             lr_scheduler_type: str = 'linear',
-            optimizer_type: str = 'adamw_hf',
+            optimizer_type: str = 'adamw_torch',
             warmup_steps: int = 10000,
             epochs: int = 3,
             weight_decay: float = 0.001,
@@ -160,6 +163,9 @@ class PretrainML:
             do_eval: bool = False,
             length_column_name: str = 'length',
             disable_tqdm: bool = False,
+            group_by_length: bool = False,
+            fp16: bool = True,
+            
             training_args_overrides: Optional[Dict] = None,
     ):
         """
@@ -169,7 +175,7 @@ class PretrainML:
         self.token_dict_path = token_dict_path
         self.model_type = model_type
         with open(token_dict_path,'rb') as f:
-            token_dict = pickle.load(f)
+            self.token_dict = pickle.load(f)
         self.example_lengths_path = example_lengths_path
         self.mode = mode
         self.output_dir = output_dir
@@ -193,13 +199,15 @@ class PretrainML:
         self.do_eval = do_eval
         self.length_column_name = length_column_name
         self.disable_tqdm = disable_tqdm
+        self.fp16 = fp16
+        self.group_by_length = group_by_length
         self.training_args_overrides = training_args_overrides
         
         setup_environment(seed)
         # load datasets and token dictionary
         self.train_ds = load_from_disk(dataset_path)
-        self.pad_id = token_dict['<pad>']
-        self.vocab_size = len(token_dict)
+        self.pad_id = self.token_dict['<pad>']
+        self.vocab_size = len(self.token_dict)
         
 
     def run_pretraining(self):
@@ -225,6 +233,7 @@ class PretrainML:
         )
         model = BertForMaskedLM(config)
         model = model.train()
+        model.gradient_checkpointing_enable()
 
         #training arguments
         training_args = get_training_arguments(
@@ -242,6 +251,8 @@ class PretrainML:
             do_eval=self.do_eval,
             length_column_name=self.length_column_name,
             disable_tqdm=self.disable_tqdm,
+            fp16= self.fp16,
+            group_by_length = self.group_by_length,
             overrides=self.training_args_overrides,
     )
         print(f"[INFO] Checkpoints: {dirs['training']}")
@@ -274,6 +285,7 @@ class PretrainML:
         n_trials: int = 8,
         backend: Literal['ray','optuma'] = 'ray'
     ):
+        
         from pathlib import Path
         import ray
         from ray import tune
@@ -287,22 +299,24 @@ class PretrainML:
         stamp = now.strftime('%y%m%d_%H%M%S')
         run_name = f"{stamp}_STgeneformer_30M_L{self.num_layers}_emb{self.embed_dim}_SL{self.max_input}_E{self.epochs}_B{self.batch_size}_LR{self.learning_rate}_LS{self.lr_scheduler_type}_WU{self.warmup_steps}_O{self.weight_decay}_DS"
         dirs = make_output_dirs(Path(self.output_dir), run_name)
-        config = build_bert_config(
-            self.model_type,
-            self.num_layers,
-            self.num_heads,
-            self.embed_dim,
-            self.max_input,
-            self.pad_id,
-            self.vocab_size,
-            self.activ_fn,
-            self.initializer_range,
-            self.layer_norm_eps,
-            self.attention_dropout,
-            self.hidden_dropout
-        )
-        model = BertForMaskedLM(config)
-        model = model.train()
+
+        def model_init():
+            config = build_bert_config(
+                self.model_type,
+                self.num_layers,
+                self.num_heads,
+                self.embed_dim,
+                self.max_input,
+                self.pad_id,
+                self.vocab_size,
+                self.activ_fn,
+                self.initializer_range,
+                self.layer_norm_eps,
+                self.attention_dropout,
+                self.hidden_dropout
+            )
+            model = BertForMaskedLM(config)
+            return model
         
         training_args = get_training_arguments(
             output_dir=dirs['training'],
@@ -319,21 +333,39 @@ class PretrainML:
             do_eval=self.do_eval,
             length_column_name=self.length_column_name,
             disable_tqdm=self.disable_tqdm,
+            group_by_length= self.group_by_length,
+            fp16=self.fp16,
             overrides=self.training_args_overrides
         )
+        
         def _hp_space(trial):
             params = {}
-            for key, spec in search_space.items():
-                if spec['type'] == 'loguniform':
-                    params[key] = trial.suggest_loguniform(key, spec['low'], spec['high'])
-                elif spec['type'] == 'categorical':
-                    params[key] = trial.suggest_categorical(key, spec['values'])
-                else:
-                    raise ValueError(f"Unknown search type {spec['type']}")
+            if backend == 'optuna':
+                for key, spec in search_space.items():
+                    if spec['type'] == 'loguniform':
+                        params[key] = trial.suggest_loguniform(key, spec['low'], spec['high'])
+                    elif spec['type'] == 'categorical':
+                        params[key] = trial.suggest_categorical(key, spec['values'])
+                    elif spef['type'] == 'int':
+                        params[key] = trial.suggest_int(key,spec['low'],spec['high'])
+                    else:
+                        raise ValueError(f"Unknown search type {spec['type']}")
+            else:
+                for key, spec in search_space.items():
+                    if spec['type'] == 'loguniform':
+                        params[key] = tune.loguniform(spec['low'], spec['high'])
+                    elif spec['type'] == 'categorical':
+                        params[key] = tune.choice(spec['values'])
+                    elif spec['type'] == 'uniform':
+                        params[key] = tune.uniform(spec['low'], spec['high'])
+                    elif spec['type'] == 'int':
+                        params[key] = tune.randint(spec['low'], spec['high'] + 1)
+                    else:
+                        raise ValueError(f"Unknown search type {spec['type']}")
             return params
 
         trainer = STFormerPretrainer(
-            model=model,
+            model_init=model_init,
             args=training_args,
             train_dataset=self.train_ds,
             token_dictionary=self.token_dict,
@@ -348,11 +380,3 @@ class PretrainML:
             resources_per_trial=resources,
         )
         print("Best trial:", best)
-
-        # save final model and tokenizer
-        final_dir = dirs['model']
-        config.save_pretrained(final_dir)
-        from stFormer.tokenization.SpatialTokenize import build_custom_tokenizer
-        tokenizer = build_custom_tokenizer(self.token_dict_path, self.mode)
-        tokenizer.save_pretrained(final_dir)
-        print("[DONE] Pretraining complete.")
