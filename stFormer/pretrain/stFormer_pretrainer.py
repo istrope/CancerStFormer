@@ -98,10 +98,15 @@ def get_training_arguments(
     do_eval: bool,
     length_column_name: str,
     disable_tqdm: bool,
-    overrides: Optional[Dict] = None
+    fp16: bool,
+    group_by_length: bool,
+    overrides: Optional[Dict] = None,
 ) -> TrainingArguments:
     """
     Build a TrainingArguments object, merging defaults with any overrides.
+
+    High-level function to configure environment and run stFormer pretraining.
+    Required: dataset_path, token_dict_path, example_lengths_path, mode, output_dir.
     """
     defaults = {
         'output_dir': str(output_dir),
@@ -115,123 +120,263 @@ def get_training_arguments(
         'optim': optimizer_type,
         'do_train': do_train,
         'do_eval': do_eval,
-        'group_by_length': True,
         'length_column_name': length_column_name,
         'disable_tqdm': disable_tqdm,
         'save_strategy': 'steps',
         'save_steps': max(1, train_dataset_length // (batch_size * 8)),
         'logging_steps': 1000,
+        'fp16': fp16,
+        'group_by_length': group_by_length
     }
     if overrides:
         defaults.update(overrides)
     return TrainingArguments(**defaults)
 
+class PretrainML:
+    def __init__(
+            self,
+            dataset_path: str,
+            token_dict_path: str,
+            example_lengths_path: str,
+            mode: Literal['spot', 'neighborhood'],
+            output_dir: str,
+            # The rest are optional with sensible defaults:
+            seed: int = 42,
+            model_type: str = 'bert',
+            num_layers: int = 6,
+            num_heads: int = 4,
+            embed_dim: int = 256,
+            max_input: int = 2048,
+            activ_fn: str = 'relu',
+            initializer_range: float = 0.02,
+            layer_norm_eps: float = 1e-12,
+            attention_dropout: float = 0.02,
+            hidden_dropout: float = 0.02,
+            batch_size: int = 12,
+            learning_rate: float = 1e-3,
+            lr_scheduler_type: str = 'linear',
+            optimizer_type: str = 'adamw_torch',
+            warmup_steps: int = 10000,
+            epochs: int = 3,
+            weight_decay: float = 0.001,
+            do_train: bool = True,
+            do_eval: bool = False,
+            length_column_name: str = 'length',
+            disable_tqdm: bool = False,
+            group_by_length: bool = False,
+            fp16: bool = True,
+            
+            training_args_overrides: Optional[Dict] = None,
+    ):
+        """
+        Initialize Bert Masked Learning
+        """
+        self.dataset_path = dataset_path
+        self.token_dict_path = token_dict_path
+        self.model_type = model_type
+        with open(token_dict_path,'rb') as f:
+            self.token_dict = pickle.load(f)
+        self.example_lengths_path = example_lengths_path
+        self.mode = mode
+        self.output_dir = output_dir
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.embed_dim = embed_dim
+        self.max_input = max_input
+        self.activ_fn = activ_fn
+        self.initializer_range = initializer_range
+        self.layer_norm_eps = layer_norm_eps
+        self.attention_dropout = attention_dropout
+        self.hidden_dropout = hidden_dropout
+        self.batch_size = batch_size
+        self.learning_rate = learning_rate
+        self.lr_scheduler_type = lr_scheduler_type
+        self.optimizer_type = optimizer_type
+        self.warmup_steps = warmup_steps
+        self.epochs = epochs
+        self.weight_decay = weight_decay
+        self.do_train = do_train
+        self.do_eval = do_eval
+        self.length_column_name = length_column_name
+        self.disable_tqdm = disable_tqdm
+        self.fp16 = fp16
+        self.group_by_length = group_by_length
+        self.training_args_overrides = training_args_overrides
+        
+        setup_environment(seed)
+        # load datasets and token dictionary
+        self.train_ds = load_from_disk(dataset_path)
+        self.pad_id = self.token_dict['<pad>']
+        self.vocab_size = len(self.token_dict)
+        
 
-def run_pretraining(
-    dataset_path: str,
-    token_dict_path: str,
-    example_lengths_path: str,
-    mode: Literal['spot', 'neighborhood'],
-    output_dir: str,
-    # The rest are optional with sensible defaults:
-    seed: int = 42,
-    model_type: str = 'bert',
-    num_layers: int = 6,
-    num_heads: int = 4,
-    embed_dim: int = 256,
-    max_input: int = 2048,
-    activ_fn: str = 'relu',
-    initializer_range: float = 0.02,
-    layer_norm_eps: float = 1e-12,
-    attention_dropout: float = 0.02,
-    hidden_dropout: float = 0.02,
-    batch_size: int = 12,
-    learning_rate: float = 1e-3,
-    lr_scheduler_type: str = 'linear',
-    optimizer_type: str = 'adamw_hf',
-    warmup_steps: int = 10000,
-    epochs: int = 3,
-    weight_decay: float = 0.001,
-    do_train: bool = True,
-    do_eval: bool = False,
-    length_column_name: str = 'length',
-    disable_tqdm: bool = False,
-    training_args_overrides: Optional[Dict] = None,
-) -> None:
-    """
-    High-level function to configure environment and run stFormer pretraining.
-    Required: dataset_path, token_dict_path, example_lengths_path, mode, output_dir.
-    """
-    setup_environment(seed)
+    def run_pretraining(self):
+        # prepare directories
+        tz = pytz.timezone('US/Central')
+        now = datetime.datetime.now(tz)
+        stamp = now.strftime('%y%m%d_%H%M%S')
+        run_name = f"{stamp}_STgeneformer_30M_L{self.num_layers}_emb{self.embed_dim}_SL{self.max_input}_E{self.epochs}_B{self.batch_size}_LR{self.learning_rate}_LS{self.lr_scheduler_type}_WU{self.warmup_steps}_O{self.weight_decay}_DS"
+        dirs = make_output_dirs(Path(self.output_dir), run_name)
+        config = build_bert_config(
+            self.model_type,
+            self.num_layers,
+            self.num_heads,
+            self.embed_dim,
+            self.max_input,
+            self.pad_id,
+            self.vocab_size,
+            self.activ_fn,
+            self.initializer_range,
+            self.layer_norm_eps,
+            self.attention_dropout,
+            self.hidden_dropout
+        )
+        model = BertForMaskedLM(config)
+        model = model.train()
+        model.gradient_checkpointing_enable()
 
-    # load datasets and token dictionary
-    train_ds = load_from_disk(dataset_path)
-    token_dict = pickle.load(open(token_dict_path, 'rb'))
-    pad_id = token_dict['<pad>']
-    vocab_size = len(token_dict)
-
-    # prepare directories
-    tz = pytz.timezone('US/Central')
-    now = datetime.datetime.now(tz)
-    stamp = now.strftime('%y%m%d_%H%M%S')
-    run_name = f"{stamp}_STgeneformer_30M_L{num_layers}_emb{embed_dim}_SL{max_input}_E{epochs}_B{batch_size}_LR{learning_rate}_LS{lr_scheduler_type}_WU{warmup_steps}_O{weight_decay}_DS"
-    dirs = make_output_dirs(Path(output_dir), run_name)
-
-    # build model
-    config = build_bert_config(
-        model_type,
-        num_layers,
-        num_heads,
-        embed_dim,
-        max_input,
-        pad_id,
-        vocab_size,
-        activ_fn,
-        initializer_range,
-        layer_norm_eps,
-        attention_dropout,
-        hidden_dropout,
+        #training arguments
+        training_args = get_training_arguments(
+            output_dir=dirs['training'],
+            logging_dir=dirs['logging'],
+            train_dataset_length=len(self.train_ds),
+            batch_size=self.batch_size,
+            learning_rate=self.learning_rate,
+            epochs=self.epochs,
+            weight_decay=self.weight_decay,
+            warmup_steps=self.warmup_steps,
+            lr_scheduler_type=self.lr_scheduler_type,
+            optimizer_type=self.optimizer_type,
+            do_train=self.do_train,
+            do_eval=self.do_eval,
+            length_column_name=self.length_column_name,
+            disable_tqdm=self.disable_tqdm,
+            fp16= self.fp16,
+            group_by_length = self.group_by_length,
+            overrides=self.training_args_overrides,
     )
-    model = BertForMaskedLM(config)
-    model = model.train()
+        print(f"[INFO] Checkpoints: {dirs['training']}")
+        print(f"[INFO] Logs: {dirs['logging']}")
 
-    # training arguments
-    training_args = get_training_arguments(
-        output_dir=dirs['training'],
-        logging_dir=dirs['logging'],
-        train_dataset_length=len(train_ds),
-        batch_size=batch_size,
-        learning_rate=learning_rate,
-        epochs=epochs,
-        weight_decay=weight_decay,
-        warmup_steps=warmup_steps,
-        lr_scheduler_type=lr_scheduler_type,
-        optimizer_type=optimizer_type,
-        do_train=do_train,
-        do_eval=do_eval,
-        length_column_name=length_column_name,
-        disable_tqdm=disable_tqdm,
-        overrides=training_args_overrides,
-    )
+        # run training
+        trainer = STFormerPretrainer(
+            model=model,
+            args=training_args,
+            train_dataset=self.train_ds,
+            token_dictionary=self.token_dict,
+            example_lengths_file=self.example_lengths_path,
+        )
+        trainer.train()
 
-    print(f"[INFO] Checkpoints: {dirs['training']}")
-    print(f"[INFO] Logs: {dirs['logging']}")
+        # save final model and tokenizer
+        final_dir = dirs['model']
+        trainer.model.save_pretrained(final_dir)
+        config.save_pretrained(final_dir)
+        from stFormer.tokenization.SpatialTokenize import build_custom_tokenizer
+        tokenizer = build_custom_tokenizer(self.token_dict_path, self.mode)
+        tokenizer.save_pretrained(final_dir)
+        print("[DONE] Pretraining complete.")
 
-    # run training
-    trainer = STFormerPretrainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_ds,
-        token_dictionary=token_dict,
-        example_lengths_file=example_lengths_path,
-    )
-    trainer.train()
 
-    # save final model and tokenizer
-    final_dir = dirs['model']
-    trainer.model.save_pretrained(final_dir)
-    config.save_pretrained(final_dir)
-    from stFormer.tokenization.SpatialTokenize import build_custom_tokenizer
-    tokenizer = build_custom_tokenizer(token_dict_path, mode)
-    tokenizer.save_pretrained(final_dir)
-    print("[DONE] Pretraining complete.")
+    def run_hyperparameter_train(
+        self,
+        search_space: Dict,
+        resources_per_trial,
+        n_trials: int = 8,
+        backend: Literal['ray','optuma'] = 'ray'
+    ):
+        
+        from pathlib import Path
+        import ray
+        from ray import tune
+
+        #  Initialize Ray 
+        ray.shutdown()
+        
+        # prepare directories
+        tz = pytz.timezone('US/Central')
+        now = datetime.datetime.now(tz)
+        stamp = now.strftime('%y%m%d_%H%M%S')
+        run_name = f"{stamp}_STgeneformer_30M_L{self.num_layers}_emb{self.embed_dim}_SL{self.max_input}_E{self.epochs}_B{self.batch_size}_LR{self.learning_rate}_LS{self.lr_scheduler_type}_WU{self.warmup_steps}_O{self.weight_decay}_DS"
+        dirs = make_output_dirs(Path(self.output_dir), run_name)
+
+        def model_init():
+            config = build_bert_config(
+                self.model_type,
+                self.num_layers,
+                self.num_heads,
+                self.embed_dim,
+                self.max_input,
+                self.pad_id,
+                self.vocab_size,
+                self.activ_fn,
+                self.initializer_range,
+                self.layer_norm_eps,
+                self.attention_dropout,
+                self.hidden_dropout
+            )
+            model = BertForMaskedLM(config)
+            return model
+        
+        training_args = get_training_arguments(
+            output_dir=dirs['training'],
+            logging_dir=dirs['logging'],
+            train_dataset_length=len(self.train_ds),
+            batch_size=self.batch_size,
+            learning_rate=self.learning_rate,
+            epochs=self.epochs,
+            weight_decay=self.weight_decay,
+            warmup_steps=self.warmup_steps,
+            lr_scheduler_type=self.lr_scheduler_type,
+            optimizer_type=self.optimizer_type,
+            do_train=self.do_train,
+            do_eval=self.do_eval,
+            length_column_name=self.length_column_name,
+            disable_tqdm=self.disable_tqdm,
+            group_by_length= self.group_by_length,
+            fp16=self.fp16,
+            overrides=self.training_args_overrides
+        )
+        
+        def _hp_space(trial):
+            params = {}
+            if backend == 'optuna':
+                for key, spec in search_space.items():
+                    if spec['type'] == 'loguniform':
+                        params[key] = trial.suggest_loguniform(key, spec['low'], spec['high'])
+                    elif spec['type'] == 'categorical':
+                        params[key] = trial.suggest_categorical(key, spec['values'])
+                    elif spef['type'] == 'int':
+                        params[key] = trial.suggest_int(key,spec['low'],spec['high'])
+                    else:
+                        raise ValueError(f"Unknown search type {spec['type']}")
+            else:
+                for key, spec in search_space.items():
+                    if spec['type'] == 'loguniform':
+                        params[key] = tune.loguniform(spec['low'], spec['high'])
+                    elif spec['type'] == 'categorical':
+                        params[key] = tune.choice(spec['values'])
+                    elif spec['type'] == 'uniform':
+                        params[key] = tune.uniform(spec['low'], spec['high'])
+                    elif spec['type'] == 'int':
+                        params[key] = tune.randint(spec['low'], spec['high'] + 1)
+                    else:
+                        raise ValueError(f"Unknown search type {spec['type']}")
+            return params
+
+        trainer = STFormerPretrainer(
+            model_init=model_init,
+            args=training_args,
+            train_dataset=self.train_ds,
+            token_dictionary=self.token_dict,
+            example_lengths_file=self.example_lengths_path,
+            )
+        resources = resources_per_trial or {"cpu": 4, "gpu": 1}
+        best = trainer.hyperparameter_search(
+            direction="minimize",
+            backend=backend,
+            hp_space=_hp_space,
+            n_trials=n_trials,
+            resources_per_trial=resources,
+        )
+        print("Best trial:", best)

@@ -8,8 +8,6 @@ A flexible framework for transformer-based analysis of spatial transcriptomics d
 
   - Spot-resolution and neighborhood-resolution tokenizers for Visium and other spatial platforms.
   - Support for both `.h5ad` and `.loom` file formats.
-  - Gene median estimation using t-Digest
-  - Memory-efficient scanning of large Anndata/loom files.
 
 - **Pretraining**
 
@@ -25,20 +23,15 @@ A flexible framework for transformer-based analysis of spatial transcriptomics d
 - **In Silico Perturbation**
 
   - `InSilicoPerturber` for single-gene or combination perturbations.
-  - Cosine-similarity shifts in cell and gene embedding spaces.
-  - Anchor-gene support for targeted perturbation experiments.
   - `InSilicoPerturberStats` to aggregate and summarize perturbation results.
 
 - **Classification & Fine-Tuning**
 
   - Utilities for training cell-type or gene classifiers with Hugging Face Transformers.
   - Ray Tune experiments for hyperparameter optimization.
-  - Best-model extraction and checkpoint management.
     
 - **Network Dynamics**
 
-  - Loads model attention from MaskedBertModel
-  - Computes average attention for genes in batch-wise manner
   - computes attention across layers/heads for all unique token pairs
   - filters node-edges by (weight value, weight percentile, or top n edges)
   - filters noe-edges by number of co-occuring tokens in dataset
@@ -59,8 +52,9 @@ git clone https://github.com/yourusername/stFormer.git
 cd stFormer
 
 # Install dependencies
-pip install torch torchaudio torchtext
+pip install torch
 pip install -r requirements.txt
+pip install stformer
 ```
 
 > **Prerequisites:** Python 3.8+, PyTorch, Transformers
@@ -68,101 +62,25 @@ pip install -r requirements.txt
 ## Usage
 
 ### 1. Tokenization and Median Estimator
-``` python
-# Compute T-Digests
-from stFormer.tokenization.median_estimator import MedianEstimator
-estimator = MedianEstimator(
-    data_dir = 'data',
-    extension = '.h5ad',
-    out_path = 'output',
-    merge_tdigests = True 
-)
-estimator.compute_tdigests(
-      file_path #optional processes single file, unless loads all in data_dir
-)
-estimator.get_median_dict()
-estimator.write_tdigests() # write to file in out_path
-estimator.write_medians() # write to file in out_path
+```
 ```
 
 ```python
-from stFormer.tokenization.SpatialTokenize import SpatialTokenizer, create_token_dictionary
 
-#create token dictionary
-token_dictionary = create_token_dictionary(median_dict=median_dict)
-with open('output/token_dictionary.pickle','wb') as file:
-    pickle.dump(token_dictionary,file)
-
-# Build spot-resolution tokenizer
-tok = SpatialTokenizer(
-    token_dict_file="output/token_dictionary.pickle",
-    gene_median_file='output/gene_medians.pickle',
-    nproc = 12,
-    mode="spot",  # or "neighbor"
-    custom_meta = {'sample_id' : 'sample', 'class' : 'classification', 'subtype' : 'subtype'}
-)
-# Tokenize dataset
-tok.tokenize(
-    data_dir = "data/visium_spot.h5ad",
-    out_dir = "output/spot",
-    prefix = 'spot',
-    file_format = 'h5ad')
 ```
 
 ### 2. Pretraining
 
 ```python
-from datasets import load_from_disk
-import pickle
 
-# Create example lengths file from tokenized data
-ds = load_from_disk('output/spot/visium_spot.dataset')
-lengths = [len(example['input_ids']) for example in ds]
-with open('output/example_lengths.pickle','wb') as file:
-    pickle.dump(lengths,file)
 ```
 
 ```python
-from stFormer.pretrain.stFormer_pretrainer import run_pretraining
 
-run_pretraining(
-   dataset_path='output/spot/visium_spot.dataset',
-   token_dict_path='output/token_dictionary.pickle',
-   example_lengths_path='output/example_lengths.pickle',
-   rootdir='output/spot',
-   seed=42,
-   num_layers=6,
-   num_heads=4,
-   embed_dim=256,
-   max_input=2048, #2048 for spot and 4096 for neighbor
-   batch_size=12,
-   lr=1e-3,
-   warmup_steps=10000,
-   epochs=3,
-   weight_decay=0.001
-)
 ```
 
-### 3. Embedding Extraction
 
-```python
-from stFormer.tokenization.embedding_extractor import EmbeddingExtractor
-
-extractor = EmbeddingExtractor(
-    token_dict_path=Path('output/token_dictionary.pickle'),
-    emb_mode='cls',
-    emb_layer = -1,
-    forward_batch_size=64
-    )
-embeddings = extractor.extract_embs(
-    model_directory='output/spot/models/250422_102707_stFormer_L6_E3/final',
-    dataset_path='output/spot/visium_spot.dataset',
-    output_directory='output/spot/embeddings',
-    output_prefix='visium_spot'
-
-)
-```
-### 4. Classification
+### 3. Classification
 
 ```python
 from stFormer.classifier.Classifier import GenericClassifier
@@ -216,18 +134,7 @@ best_run = classifier.train(
 )
 ```
 
-```python
-#save confusion matrix heatmap with inbuilt plotting functionality
 
-classifier.plot_predictions(
-    predictions_file="output/models/classification/predictions.pkl",
-    id_class_dict_file=map_path,
-    title="Visium Spot Subtype Predictions",
-    output_directory="output/models/classification",
-    output_prefix="visium_spot",
-    class_order=class_order
-)
-```
 ### 5. In Silico Perturbation
 
 ```python
@@ -291,10 +198,6 @@ grn.build_graph(
     min_cooccurrence=100 #filter node-edges by number of samples expressing pair
 )
 
-grn.save_edge_list(
-    output_path = 'output/spot/gene_network_edges.csv')
-
-grn.plot_network('output/spot/gene_network.png')
 ```
 
 ## Contributing

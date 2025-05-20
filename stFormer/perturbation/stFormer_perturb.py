@@ -46,6 +46,7 @@ logger = logging.getLogger(__name__)
 
 class InSilicoPerturber:
     valid_option_dict = {
+        'mode': {'spot','neighborhood'},
         "perturb_type": {"delete", "overexpress", "inhibit", "activate"},
         "perturb_rank_shift": {None, 1, 2, 3},
         "genes_to_perturb": {"all", list},
@@ -67,6 +68,7 @@ class InSilicoPerturber:
 
     def __init__(
         self,
+        mode ='spot',
         perturb_type="delete",
         perturb_rank_shift=None,
         genes_to_perturb="all",
@@ -89,28 +91,14 @@ class InSilicoPerturber:
         """
         Initialize in silico perturber.
         **Parameters:**
+        mode: {'spot','neighborhood'}
+            | Type of dataset tokenization option
+            | 'spot': if dataset is tokenized genes from only spot
+            | 'neighborhood': if dataset is tokenized from spot and surrounding neighbors
         perturb_type : {"delete", "overexpress", "inhibit", "activate"}
             | Type of perturbation.
             | "delete": delete gene from rank value encoding
             | "overexpress": move gene to front of rank value encoding
-            | *(TBA)* "inhibit": move gene to lower quartile of rank value encoding
-            | *(TBA)* "activate": move gene to higher quartile of rank value encoding
-        *(TBA)* perturb_rank_shift : None, {1,2,3}
-            | Number of quartiles by which to shift rank of gene.
-            | For example, if perturb_type="activate" and perturb_rank_shift=1:
-            |     genes in 4th quartile will move to middle of 3rd quartile.
-            |     genes in 3rd quartile will move to middle of 2nd quartile.
-            |     genes in 2nd quartile will move to middle of 1st quartile.
-            |     genes in 1st quartile will move to front of rank value encoding.
-            | For example, if perturb_type="inhibit" and perturb_rank_shift=2:
-            |     genes in 1st quartile will move to middle of 3rd quartile.
-            |     genes in 2nd quartile will move to middle of 4th quartile.
-            |     genes in 3rd or 4th quartile will move to bottom of rank value encoding.
-        genes_to_perturb : "all", list
-            | Default is perturbing each gene detected in each cell in the dataset.
-            | Otherwise, may provide a list of ENSEMBL IDs of genes to perturb.
-            | If gene list is provided, then perturber will only test perturbing them all together
-            | (rather than testing each possible combination of the provided genes).
         combos : {0,1}
             | Whether to perturb genes individually (0) or in pairs (1).
         anchor_gene : None, str
@@ -177,6 +165,7 @@ class InSilicoPerturber:
         except RuntimeError:
             pass
         self.perturb_type = perturb_type
+        self.mode = mode
         self.perturb_rank_shift = perturb_rank_shift
         self.genes_to_perturb = genes_to_perturb
         self.combos = combos
