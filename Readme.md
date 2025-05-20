@@ -2,6 +2,40 @@
 
 A flexible framework for transformer-based analysis of spatial transcriptomics data. stFormer provides tools for data tokenization, pretraining, embedding extraction, in silico perturbation, and downstream classification.
 
+## Installation
+
+```bash
+# Clone this repository
+git clone https://github.com/yourusername/stFormer.git
+cd stFormer
+
+# Install dependencies
+pip install torch
+pip install -r requirements.txt
+pip install stformer
+```
+
+> **Prerequisites:** Python 3.8+, PyTorch, Transformers
+
+## Model Hub
+Check out pretrained models at our hugging face repo:  [stFormer](https://huggingface.co/Istrope/stFormer)
+
+**Description:**
+- `spot:` single spot resolution tokenized and pretrained model, captures expression in a 55um radius
+- `neighborhood:` spot + neighbor cell resolution, captures expression around 110um radius
+- `cancer:` pan-cancer pretrained model, can be utilized for cancer specific datasets
+
+| Model | Location |
+| --- | --- |
+| `spot` |  [spot-model](https://huggingface.co/Istrope/stFormer/tree/main/models/spot) |
+| `neighborhood` | coming soon  |
+| `cancer` |  coming soon |
+
+
+## Publication
+
+Preprint to come: 
+
 ## Features
 
 - **Data Tokenization**
@@ -41,42 +75,6 @@ A flexible framework for transformer-based analysis of spatial transcriptomics d
   - Dataset inspection: view `input_ids`, `length`, and metadata fields in Hugging Face `.dataset` files.
   - Gene-marker extraction and ranking with Scanpy.
   - Parallelized DE testing and outlier removal for UMAP embeddings.
-
-
-
-## Installation
-
-```bash
-# Clone this repository
-git clone https://github.com/yourusername/stFormer.git
-cd stFormer
-
-# Install dependencies
-pip install torch
-pip install -r requirements.txt
-pip install stformer
-```
-
-> **Prerequisites:** Python 3.8+, PyTorch, Transformers
-
-## Model Hub
-Check out pretrained models at our hugging face repo:  [stFormer](https://huggingface.co/Istrope/stFormer)
-
-**Description:**
-- `spot:` single spot resolution tokenized and pretrained model, captures expression in a 55um radius
-- `neighborhood:` spot + neighbor cell resolution, captures expression around 110um radius
-- `cancer:` pan-cancer pretrained model, can be utilized for cancer specific datasets
-
-| Model | Location |
-| --- | --- |
-| `spot` |  [spot-model](https://huggingface.co/Istrope/stFormer/tree/main/models/spot) |
-| `neighborhood` | coming soon  |
-| `cancer` |  coming soon |
-
-
-## Publication
-
-Preprint to come: 
 
 ## Contributing
 
