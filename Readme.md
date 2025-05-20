@@ -68,7 +68,7 @@ Check out pretrained models at our hugging face repo:  [stFormer](https://huggin
 - `cancer:` pan-cancer pretrained model, can be utilized for cancer specific datasets
 
 |             Model             |        Location       | <br>
-|:------------------------------:|:--------------------:| <br>
+| :---:   |    :---:  | <br>
 |            **Spot**           |       [spot-model](https://huggingface.co/Istrope/stFormer/tree/main/models/spot)    | <br>
 |       **Neighborhood**        |        coming soon           | <br>
 |           **Cancer**          |        coming soon           | <br>
