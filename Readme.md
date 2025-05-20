@@ -59,146 +59,22 @@ pip install stformer
 
 > **Prerequisites:** Python 3.8+, PyTorch, Transformers
 
-## Usage
+## Model Hub
+Check out pretrained models at our hugging face repo:  [stFormer](https://huggingface.co/Istrope/stFormer)
 
-### 1. Tokenization and Median Estimator
-```
-```
+**Description:**
+- `spot:` single spot resolution tokenized and pretrained model, captures expression in a 55um radius
+- `neighborhood:` spot + neighbor cell resolution, captures expression around 110um radius
+- `cancer:` pan-cancer pretrained model, can be utilized for cancer specific datasets
+| Model    | Location |
+| -------- | ------- |
+| **Spot**  | [spot-model](https://huggingface.co/Istrope/stFormer/tree/main/models/spot)    |
+| **Neighborhood** | coming soon     |
+| **Cancer**    | coming soon    |
 
-```python
+## Publication
 
-```
-
-### 2. Pretraining
-
-```python
-
-```
-
-```python
-
-```
-
-
-### 3. Classification
-
-```python
-from stFormer.classifier.Classifier import GenericClassifier
-
-# Fine Tune Classifier Based on Metadata Group and Train from a Pretrained MaskedLM Model
-classifier = GenericClassifier(
-    metadata_column = 'subtype', #what metadata to train classifier on 
-    nproc=24)
-    
-ds_path, map_path = classifier.prepare_data(
-    input_data_file = 'output/spot/visium_spot.dataset',
-    output_directory = 'tmp',
-    output_prefix = 'visium_spot'
-    )
-
-trainer = classifier.train(
-    model_checkpoint='output/spot/models/250422_102707_stFormer_L6_E3/final',
-    dataset_path = ds_path,
-    output_directory = 'output/models/classification',
-    test_size=0.2 #create test/train split
-)
-```
-```python
-from stFormer.classifier.Classifier import GenericClassifier
-
-# Fine-Tuning with Hyperparameter Tuning (saves best model)
-classifier = GenericClassifier(
-    metadata_column = 'subtype',
-    ray_config={ #check BertForSequenceClassification for addional hyperparameters
-        "learning_rate":[1e-5,5e-5], #loguniform learning rate
-        "num_train_epochs":[2,3], #choice
-        "weight_decay": [0.0, 0.3], #tune.uniform across values
-        'lr_scheduler_type': ["linear","cosine","polynomial"], #scheduler
-        'seed':[0,100]
-        },
-    nproc = 24
-    )
-
-ds_path, map_path = classifier.prepare_data(
-    input_data_file = 'output/spot/visium_spot.dataset',
-    output_directory = 'tmp',
-    output_prefix = 'visium_spot'
-    )
-
-best_run = classifier.train(
-    model_checkpoint='output/spot/models/250422_102707_stFormer_L6_E3/final',
-    dataset_path = ds_path,
-    output_directory = 'output/models/tuned_classification',
-    n_trials=10,
-    test_size=0.2 #Test/Train Split
-)
-```
-
-
-### 5. In Silico Perturbation
-
-```python
-from stFormer.perturbation.stFormer_perturb import InSilicoPerturber
-from stFormer.perturbation.perturb_stats import InSilicoPerturberStats
-
-isp = InSilicoPerturber(
-            perturb_type="delete",
-            genes_to_perturb=['ENSG00000188389'],
-            #perturb_rank_shift = None,
-            model_type="Pretrained",
-            num_classes=0,
-            emb_mode="cell_and_gene",
-            cell_emb_style='mean_pool',
-            max_ncells=1000,
-            emb_layer=0,
-            forward_batch_size=10,
-            nproc=12,
-            token_dictionary_file='output/token_dictionary.pickle',
-         )
-
-isp.perturb_data(
-    model_directory='output/spot/models/250422_102707_stFormer_L6_E3/final',
-    input_data_file='output/spot/visium_spot.dataset',
-    output_directory='output/perturb',
-    output_prefix='perturb_spot')
-
-ispstats = InSilicoPerturberStats(
-    mode='aggregate_gene_shifts',
-    genes_perturbed = ['ENSG00000188389'],
-    pickle_suffix = '_raw.pickle',
-    token_dictionary_file='output/token_dictionary.pickle',
-    gene_name_id_dictionary_file='output/ensembl_mapping_dict.pickle'
-)
-ispstats.get_stats('output/perturb',None,'output/perturb_stats','perturb_spot')
-```
-
-### 5. Network Graph
-
-```python
-from stFormer.network_dynamics.gene_regulatory_network import GeneRegulatoryNetwork
-
-# Compute Gene Regulatory Network by Capturing Model Attention Weights Across Pairs
-grn = GeneRegulatoryNetwork(
-    model_dir = 'output/spot/models/250422_102707_stFormer_L6_E3/final',
-    dataset_path = 'output/spot/visium_spot.dataset',
-    model_type = 'Pretrained',
-    metadata_column = 'subtype',
-    metadata_value = 'TNBC',
-    device='cuda',
-    batch_size=24,
-    nproc = 12
-)
-
-# computes average attention for a gene in a batch from pretrained model
-grn.compute_attention()
-
-#Can take a long time, computing average i,j attention across all samples for all token pairs
-grn.build_graph(
-    percentile = 0.99999, #filter node-edges by attention weight (value above percentile)
-    min_cooccurrence=100 #filter node-edges by number of samples expressing pair
-)
-
-```
+Preprint to come: 
 
 ## Contributing
 
