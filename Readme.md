@@ -66,12 +66,12 @@ Check out pretrained models at our hugging face repo:  [stFormer](https://huggin
 - `spot:` single spot resolution tokenized and pretrained model, captures expression in a 55um radius
 - `neighborhood:` spot + neighbor cell resolution, captures expression around 110um radius
 - `cancer:` pan-cancer pretrained model, can be utilized for cancer specific datasets
+| Command | Description |
+| --- | --- |
+| `spot` |  [spot-model](https://huggingface.co/Istrope/stFormer/tree/main/models/spot) |
+| `neighborhood` | coming soon  |
+| `cancer` |  coming soon |
 
-|             Model             |        Location       | <br>
-| :---:   |    :---:  | <br>
-|            **Spot**           |       [spot-model](https://huggingface.co/Istrope/stFormer/tree/main/models/spot)    | <br>
-|       **Neighborhood**        |        coming soon           | <br>
-|           **Cancer**          |        coming soon           | <br>
 
 ## Publication
 
