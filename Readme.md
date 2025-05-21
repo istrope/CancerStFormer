@@ -22,7 +22,7 @@ Check out pretrained models at our hugging face repo:  [stFormer](https://huggin
 
 **Description:**
 - `spot:` single spot resolution tokenized and pretrained model, captures expression in a 55um radius
-- `neighborhood:` spot + neighbor cell resolution, captures expression around 110um radius
+- `neighborhood:` spot + neighbor cell resolution, captures expression around 165um radius
 - `cancer:` pan-cancer pretrained model, can be utilized for cancer specific datasets
 
 | Model | Location |
