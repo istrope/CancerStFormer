@@ -5,9 +5,9 @@ A flexible framework for transformer-based analysis of spatial transcriptomics d
 ## Installation
 
 ```bash
-# Clone this repository
-git clone https://github.com/yourusername/stFormer.git
-cd stFormer
+#create a conda environment or virtual environment
+conda create -n stformer python>=3.8
+conda activate stformer
 
 # Install dependencies
 pip install torch
