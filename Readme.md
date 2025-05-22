@@ -13,9 +13,12 @@ cd stFormer
 pip install torch
 pip install -r requirements.txt
 pip install stformer
+
+# if using deepspeed:
+pip install mpi4py, deepspeed
 ```
 
-> **Prerequisites:** Python 3.8+, OpenMPI (or MPICH)
+> **Prerequisites:** Python 3.8+, OpenMPI (for deepspeed only)
 
 ## Model Hub
 Check out pretrained models at our hugging face repo:  [stFormer](https://huggingface.co/Istrope/stFormer)
