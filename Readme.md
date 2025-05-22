@@ -15,7 +15,7 @@ pip install -r requirements.txt
 pip install stformer
 ```
 
-> **Prerequisites:** Python 3.8+, PyTorch, Transformers
+> **Prerequisites:** Python 3.8+, OpenMPI (or MPICH)
 
 ## Model Hub
 Check out pretrained models at our hugging face repo:  [stFormer](https://huggingface.co/Istrope/stFormer)
