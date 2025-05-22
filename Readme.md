@@ -6,7 +6,7 @@ A flexible framework for transformer-based analysis of spatial transcriptomics d
 
 ```bash
 #create a conda environment or virtual environment
-conda create -n stformer python>=3.8
+conda create -n stformer python=3.10
 conda activate stformer
 
 # Install dependencies
