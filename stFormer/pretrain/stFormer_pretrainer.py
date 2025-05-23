@@ -13,7 +13,8 @@ Example usage:
     )
 """
 from pathlib import Path
-from typing import Dict, Optional, Literal
+from typing import Dict, Optional, Literal, Sequence
+from difflib import get_close_matches
 import os
 import datetime
 import random
@@ -49,6 +50,49 @@ def make_output_dirs(output_dir: Path, run_name: str) -> Dict[str, Path]:
     for path in dirs.values():
         path.mkdir(parents=True, exist_ok=True)
     return dirs
+
+
+
+def choose_closest(name: str,
+                   supported: Sequence[str],
+                   unsupported: Optional[Sequence[str]] = None,
+                   cutoff: float = 0.4) -> str:
+    # Reject known‐unsupported
+    if unsupported and name.lower() in {x.lower() for x in unsupported}:
+        raise ValueError(f"{name!r} is not supported by deepspeed. "
+                         f"Choose one of: {supported}")
+
+    # Exact‐case‐insensitive match
+    for cand in supported:
+        if name.lower() == cand.lower():
+            return cand
+
+    # Fuzzy match
+    matches = get_close_matches(name, supported, n=1, cutoff=cutoff)
+    if matches:
+        candidate = matches[0]
+        print(f"[INFO] choosing closest match {candidate!r} for input {name!r}")
+        return candidate
+
+    raise ValueError(f"{name!r} likely not supported by deepspeed. "
+                     f"Choose one of: {supported}")
+
+
+def check_deepspeed_optimizer(optimizer_type: str) -> str:
+    supported = ['Adam', 'AdamW', 'OneBitAdam', 'Lamb']
+    unsupported = [
+        'Adafactor','Adadelta','Adagrad','Adamax','ASGD',
+        'LBFGS','NAdam','RAdam','RMSprop','Rprop','SGD'
+    ]
+    return choose_closest(optimizer_type, supported, unsupported)
+
+
+def check_deepspeed_scheduler(lr_scheduler_type: str) -> str:
+    supported = [
+        'WarmupLR', 'WarmupDecayLR', 'WarmupCosineLR',
+        'OneCycle', 'LRRangeTest'
+    ]
+    return choose_closest(lr_scheduler_type, supported)
 
 
 def build_bert_config(
@@ -157,9 +201,13 @@ def build_deepspeed(
     Configuration function for stFormer pretraining and passing Trainer to deepspeed
     required: training_argument dictionary
     """
+    #need to integrate difflib sequencematcher for optimizer and scheduler
+    optimizer = check_deepspeed_optimizer(optimizer_type)
+    scheduler = check_deepspeed_scheduler(lr_scheduler_type)
+
     deepspeed_defaults = {
         "optimizer": {
-            "type": optimizer_type,
+            "type": optimizer,
             "params": {
                 "lr": learning_rate,
                 "betas": "auto",
@@ -168,9 +216,9 @@ def build_deepspeed(
                 }
             },
         "scheduler": {
-            "type": lr_scheduler_type,
+            "type":  scheduler,
             "params": {
-                "total_num_steps": "auto",
+                #"total_num_steps": "auto",
                 "warmup_min_lr": "auto",
                 "warmup_max_lr": "auto",
                 "warmup_num_steps": warmup_steps
@@ -360,6 +408,7 @@ class PretrainML:
 
         #run training
         if self.deepspeed:
+            print(f'[INFO] running with deepspeed')
             training_args = build_deepspeed(
                 output_dir=dirs['training'],
                 logging_dir=dirs['logging'],
