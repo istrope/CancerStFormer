@@ -31,8 +31,8 @@ Check out pretrained models at our hugging face repo:  [stFormer](https://huggin
 | Model | Location |
 | --- | --- |
 | `spot` |  [spot-model](https://huggingface.co/Istrope/stFormer/tree/main/models/spot) |
-| `neighborhood` | coming soon  |
-| `cancer` |  coming soon |
+| `neighborhood` | [neighborhood-model](https://huggingface.co/Istrope/stFormer/tree/main/models/neighbor)  |
+| `pan-human` |  coming soon |
 
 
 ## Publication
