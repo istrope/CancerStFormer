@@ -52,7 +52,7 @@ import logging
 from pathlib import Path
 import torch
 torch.backends.cudnn.benchmark = True
-from datasets import load_from_disk, DatasetDict
+from datasets import load_from_disk
 from transformers import (
     Trainer,
     TrainingArguments,
@@ -230,6 +230,7 @@ class GenericClassifier:
         Train or tune a classifier.
         If eval_dataset_path is None, auto-split dataset_path using test_size.
         """
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu') 
         # Ray Tune path
         if self.ray_config and n_trials > 0:
             return self._ray_tune(
@@ -287,14 +288,14 @@ class GenericClassifier:
         # Model init
         config = AutoConfig.from_pretrained(
             model_checkpoint,
-            num_labels=num_labels,           # override the final head size to match our sequence (different classification task)
+            num_labels=num_labels,          
         )
         model = ModelClass.from_pretrained(
             model_checkpoint,
             config=config,
             ignore_mismatched_sizes=True
         )
-        model.to("cuda:0")
+        model.to('cpu')
 
         if self.freeze_layers > 0 and hasattr(model, 'bert'):
             for l in model.bert.encoder.layer[:self.freeze_layers]:
@@ -350,7 +351,7 @@ class GenericClassifier:
             model_checkpoint = str(ckpt.resolve())
             local_files_only = True
         else:
-            local_files_only = False  # HF Hub repo ID assumed
+            local_files_only = False  
 
         outd = Path(output_directory)
         outd.mkdir(parents=True, exist_ok=True)
@@ -393,6 +394,7 @@ class GenericClassifier:
 
         #  Model init function 
         def model_init():
+            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
             config = AutoConfig.from_pretrained(
                 model_checkpoint,
                 num_labels=len(self.label_mapping),  # override the final head size to match our sequence (different classification task)
@@ -407,7 +409,7 @@ class GenericClassifier:
                 for layer in model.bert.encoder.layer[: self.freeze_layers]:
                     for p in layer.parameters():
                         p.requires_grad = False
-            return model.to("cuda:0")
+            return model.to(device)
 
         #  Tokenizer & collator 
         tokenizer = AutoTokenizer.from_pretrained(

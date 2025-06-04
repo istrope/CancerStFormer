@@ -51,7 +51,7 @@ from transformers import (
 from torch.utils.data import RandomSampler
 from transformers.trainer_utils import has_length
 from transformers.trainer_pt_utils import LengthGroupedSampler
-from transformers.utils import logging, to_py_obj
+from transformers.utils import logging
 
 logger = logging.get_logger(__name__)
 

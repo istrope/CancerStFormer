@@ -81,14 +81,12 @@ import scanpy as sc
 import loompy
 import scipy.sparse as sp
 from scipy.spatial import Delaunay
-from datasets import Dataset, concatenate_datasets
+from datasets import Dataset
 from sklearn.model_selection import train_test_split
 from tqdm import tqdm
 import crick.tdigest
 from tokenizers import Tokenizer, models, pre_tokenizers, decoders
 from transformers import PreTrainedTokenizerFast
-from numba import njit, prange, set_num_threads, get_num_threads
-import torch
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)

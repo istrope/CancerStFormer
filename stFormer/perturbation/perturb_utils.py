@@ -1,7 +1,6 @@
 import itertools as it
 import logging
 import pickle
-import re
 from collections import defaultdict
 from typing import List
 
