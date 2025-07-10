@@ -32,7 +32,7 @@ Check out pretrained models at our hugging face repo:  [stFormer](https://huggin
 | --- | --- |
 | `spot` |  [spot-model](https://huggingface.co/Istrope/stFormer/tree/main/models/spot) |
 | `neighborhood` | [neighborhood-model](https://huggingface.co/Istrope/stFormer/tree/main/models/neighbor)  |
-| `pan-human` |  coming soon |
+| `sequence-classifier` |  [tissue-model](https://huggingface.co/Istrope/stFormer/tree/main/models/tissue_classifier) |
 
 
 ## Publication
