@@ -6,13 +6,13 @@ A flexible framework for transformer-based analysis of spatial transcriptomics d
 
 ```bash
 #create a conda environment or virtual environment
-conda create -n stformer python=3.10
-conda activate stformer
+conda create -n cstformer python=3.10
+conda activate cstformer
 
 # Install dependencies
 pip install torch
 pip install -r requirements.txt
-pip install stformer
+pip install cstformer
 
 # if using deepspeed:
 pip install mpi4py, deepspeed
@@ -21,7 +21,7 @@ pip install mpi4py, deepspeed
 > **Prerequisites:** Python 3.8+, OpenMPI (for deepspeed only)
 
 ## Model Hub
-Check out pretrained models at our hugging face repo:  [stFormer](https://huggingface.co/Istrope/stFormer)
+Check out pretrained models at our hugging face repo:  [CancerStFormer](https://huggingface.co/Istrope/stFormer)
 
 **Description:**
 - `spot:` single spot resolution tokenized and pretrained model, captures expression in a 55um radius
