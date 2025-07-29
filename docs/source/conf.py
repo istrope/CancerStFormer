@@ -19,7 +19,8 @@ extensions = [
     'sphinx.ext.intersphinx',
     'myst_parser',
     'sphinx.ext.viewcode',
-    'sphinxcontrib.bibtex'
+    'sphinxcontrib.bibtex',
+    'myst_nb
 ]
 source_suffix = {
     ".rst": "restructuredtext",
