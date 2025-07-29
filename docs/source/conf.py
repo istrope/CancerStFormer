@@ -34,11 +34,7 @@ myst_enable_extensions = [
     "html_image",
     "html_admonition",
 ]
-myst_url_schemes = ("http", "https", "mailto", "ftp")
-myst_heading_anchors = 3
-nb_output_stderr = "remove"
 nb_execution_mode = "off"
-nb_merge_streams = True
 
 # Bibliography settings
 bibtex_bibfiles = ["references.bib"]
