@@ -1,4 +1,4 @@
-TUTORIAL REFERNCE
+Tutorial Notebooks
 =================
 
 .. toctree::
