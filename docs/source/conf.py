@@ -31,6 +31,7 @@ myst_enable_extensions = [
     "colon_fence",
     "deflist",
 ]
+myst_nb_execution_mode = "off"
 
 # Bibliography settings
 bibtex_bibfiles = ["references.bib"]
