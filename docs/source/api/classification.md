@@ -1,7 +1,8 @@
+# Classification
+
 ## Classifier
 
-
-### class GenericClassifier
+### class: GenericClassifier
 
 ```python
 class GenericClassifier:
@@ -46,33 +47,7 @@ Stores settings for data filtering, label mapping, training arguments (with defa
 
 ---
 
-#### prepare_data
-
-```python
-prepare_data(
-    input_data: str | Dataset,
-    output_directory: str,
-    output_prefix: str
-) -> tuple[str, str]
-```
-Filter, label, and save a Hugging Face dataset for classification.
-
-**Description**  
-Applies metadata filters, removes rare classes, downsamples, maps original labels to integer `label`, and writes the labeled dataset and label mapping to disk.
-
-**Parameters**  
-- **input_data** (`str` or `Dataset`): Path or in-memory Hugging Face dataset.  
-- **output_directory** (`str`): Directory where outputs will be saved.  
-- **output_prefix** (`str`): Filename prefix for saved dataset and mapping.
-
-**Returns**  
-- Tuple of (`dataset_path`, `label_map_path`), where:
-  - **dataset_path** (`str`): Path to `{output_prefix}_labeled.dataset`.  
-  - **label_map_path** (`str`): Path to `{output_prefix}_id_class_dict.pkl`.
-
----
-
-#### _load_tokenizer
+#### load_tokenizer
 
 ```python
 _load_tokenizer(
@@ -92,39 +67,7 @@ Determines if `name_or_path` points to a pickle (custom vocab) or a standard pre
 
 ---
 
-#### train
-
-```python
-train(
-    model_checkpoint: str,
-    dataset_path: str,
-    output_directory: str,
-    eval_dataset: str | Dataset | None = None,
-    n_trials: int = 0,
-    test_size: float = 0.2,
-    tokenizer_name_or_path: str | None = None
-) -> Trainer
-```
-Train or hyperparameter-tune a classification model.
-
-**Description**  
-Auto-splits train/test if needed, loads datasets, configures tokenizer and collator, initializes model and `Trainer`, optionally runs Ray Tune, and trains. Saves final model and predictions.
-
-**Parameters**  
-- **model_checkpoint** (`str`): Pretrained model name or local path.  
-- **dataset_path** (`str`): Directory of labeled dataset from `prepare_data()`.  
-- **output_directory** (`str`): Directory to save checkpoints and outputs.  
-- **eval_dataset** (`str` | `Dataset`, optional): Separate eval set; if None, auto-splits by `test_size`.  
-- **n_trials** (`int`, default `0`): Number of Ray Tune trials (requires `ray_config`).  
-- **test_size** (`float`, default `0.2`): Fraction of data for test split.  
-- **tokenizer_name_or_path** (`str`, optional): Override tokenizer source.
-
-**Returns**  
-- **Trainer**: A Hugging Face `Trainer` instance after training.
-
----
-
-#### _ray_tune
+#### ray_tune
 
 ```python
 _ray_tune(
@@ -156,6 +99,67 @@ Sets up Ray, defines search space from `ray_config`, performs hyperparameter sea
 
 ---
 
+### prepare_data
+
+```python
+prepare_data(
+    input_data: str | Dataset,
+    output_directory: str,
+    output_prefix: str
+) -> tuple[str, str]
+```
+Filter, label, and save a Hugging Face dataset for classification.
+
+**Description**  
+Applies metadata filters, removes rare classes, downsamples, maps original labels to integer `label`, and writes the labeled dataset and label mapping to disk.
+
+**Parameters**  
+- **input_data** (`str` or `Dataset`): Path or in-memory Hugging Face dataset.  
+- **output_directory** (`str`): Directory where outputs will be saved.  
+- **output_prefix** (`str`): Filename prefix for saved dataset and mapping.
+
+**Returns**  
+- Tuple of (`dataset_path`, `label_map_path`), where:
+  - **dataset_path** (`str`): Path to `{output_prefix}_labeled.dataset`.  
+  - **label_map_path** (`str`): Path to `{output_prefix}_id_class_dict.pkl`.
+
+---
+
+
+### train
+
+```python
+train(
+    model_checkpoint: str,
+    dataset_path: str,
+    output_directory: str,
+    eval_dataset: str | Dataset | None = None,
+    n_trials: int = 0,
+    test_size: float = 0.2,
+    tokenizer_name_or_path: str | None = None
+) -> Trainer
+```
+Train or hyperparameter-tune a classification model.
+
+**Description**  
+Auto-splits train/test if needed, loads datasets, configures tokenizer and collator, initializes model and `Trainer`, optionally runs Ray Tune, and trains. Saves final model and predictions.
+
+**Parameters**  
+- **model_checkpoint** (`str`): Pretrained model name or local path.  
+- **dataset_path** (`str`): Directory of labeled dataset from `prepare_data()`.  
+- **output_directory** (`str`): Directory to save checkpoints and outputs.  
+- **eval_dataset** (`str` | `Dataset`, optional): Separate eval set; if None, auto-splits by `test_size`.  
+- **n_trials** (`int`, default `0`): Number of Ray Tune trials (requires `ray_config`).  
+- **test_size** (`float`, default `0.2`): Fraction of data for test split.  
+- **tokenizer_name_or_path** (`str`, optional): Override tokenizer source.
+
+**Returns**  
+- **Trainer**: A Hugging Face `Trainer` instance after training.
+
+---
+
+### Predictions
+
 #### evaluate
 
 ```python
@@ -183,7 +187,6 @@ Loads model, tokenizer, and dataset, sets up a `Trainer`, runs evaluation, and l
 - **dict**: Evaluation metrics from `Trainer.evaluate()`.
 
 ---
-
 #### plot_confusion_matrix
 
 ```python
@@ -235,6 +238,7 @@ Delegate prediction summary plotting to utility functions.
 - `None`
 
 ---
+
 ### build_custom_tokenizer
 ```python
 build_custom_tokenizer(

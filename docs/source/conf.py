@@ -16,6 +16,7 @@ repository_url='https://github.com/istrope/CancerStFormer'
 
 extensions = [
     'sphinx.ext.duration',
+    'sphinx.ext.coverage',
     'sphinx.ext.doctest',
     'sphinx.ext.autodoc',
     'sphinx.ext.autosummary',
