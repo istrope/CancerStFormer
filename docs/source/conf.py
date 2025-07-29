@@ -26,13 +26,19 @@ source_suffix = {
     ".md": "myst-nb",
     '.ipynb':'myst-nb'
 }
-
 myst_enable_extensions = [
+    "amsmath",
     "colon_fence",
     "deflist",
+    "dollarmath",
+    "html_image",
+    "html_admonition",
 ]
-
-jupyter_execute_notebooks = 'off'
+myst_url_schemes = ("http", "https", "mailto", "ftp")
+myst_heading_anchors = 3
+nb_output_stderr = "remove"
+nb_execution_mode = "off"
+nb_merge_streams = True
 
 # Bibliography settings
 bibtex_bibfiles = ["references.bib"]
