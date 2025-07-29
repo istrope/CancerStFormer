@@ -1,5 +1,7 @@
-## Module: GRN
+# Gene Regulatory Network
+Module to take self attention weights throughout model pretraining and construct a gene regulatory network graph
 
+## GeneRegulatoryNetwork
 ```python
 class GeneRegulatoryNetwork:
     def __init__(
@@ -41,6 +43,7 @@ Initialize a gene regulatory network extractor using attention from a pretrained
 
 ---
 
+### load_model_and_tokenizer
 ```python
     def _load_model_and_tokenizer(self) -> None
 ```
@@ -63,7 +66,7 @@ Load model and tokenizer from `model_dir`, enabling attention outputs.
 - None
 
 ---
-
+### load_dataset
 ```python
     def _load_dataset(self) -> None
 ```
@@ -84,7 +87,7 @@ Load and preprocess the Hugging Face dataset from `dataset_path`.
 - None
 
 ---
-
+### compute_attention
 ```python
     def compute_attention(self) -> None
 ```
@@ -106,7 +109,7 @@ Compute the average attention weight matrix across all examples.
 - None
 
 ---
-
+### build_graph
 ```python
     def build_graph(
         self,
@@ -142,7 +145,7 @@ Construct a directed graph from the averaged attention matrix.
 - None
 
 ---
-
+### save_edge_list
 ```python
     def save_edge_list(
         self,
@@ -168,7 +171,7 @@ Export the graph as a CSV edge list.
 - None
 
 ---
-
+### plot_network
 ```python
     def plot_network(
         self,
@@ -191,3 +194,4 @@ Visualize the regulatory network using a spring layout.
 **Returns**
 
 - None
+

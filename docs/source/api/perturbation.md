@@ -1,5 +1,6 @@
-## Module: Perturbation 
+# In-Silico Perturbation
 
+## class: InSilicoPerturber
 ```python
 class InSilicoPerturber:
     def __init__(
@@ -53,25 +54,9 @@ Instantiate an in silico perturber to simulate gene-level or cell-level perturba
 **Returns**
 
 - Instance of `InSilicoPerturber`.
-
 ---
 
-```python
-def validate_options(self) -> None
-```
-
-Validate constructor options for type, compatibility, and development status.
-
-**Parameters**
-
-- **self**: Perturber instance.
-
-**Raises**
-
-- **ValueError**: On invalid or incompatible options.
-
----
-
+### perturb_data
 ```python
 def perturb_data(
     self,
@@ -96,25 +81,7 @@ Run the full perturbation workflow: load model, filter data, apply perturbs.
 - `None`
 
 ---
-
-```python
-def apply_additional_filters(
-    self,
-    filtered_input_data: Dataset
-) -> Dataset
-```
-
-Apply state-based, token-based, downsampling, and slicing filters.
-
-**Parameters**
-
-- **filtered\_input\_data** (`Dataset`): Dataset after initial metadata filters.
-
-**Returns**
-
-- **Dataset**: Further filtered, sorted, and sliced dataset.
-
----
+### isp_perturb_set
 
 ```python
 def isp_perturb_set(
@@ -140,7 +107,7 @@ Perform group perturbations on the dataset and compute cosine similarities.
 - `None`
 
 ---
-
+### isp_perturb_all
 ```python
 def isp_perturb_all(
     self,
@@ -166,6 +133,47 @@ Perturb each cell individually, compute embeddings, and save results in batches.
 
 ---
 
+
+## Perturb Utility Functions
+
+### validate_options
+```python
+def validate_options(self) -> None
+```
+
+Validate constructor options for type, compatibility, and development status.
+
+**Parameters**
+
+- **self**: Perturber instance.
+
+**Raises**
+
+- **ValueError**: On invalid or incompatible options.
+
+---
+
+### apply_additional_filters
+```python
+def apply_additional_filters(
+    self,
+    filtered_input_data: Dataset
+) -> Dataset
+```
+
+Apply state-based, token-based, downsampling, and slicing filters.
+
+**Parameters**
+
+- **filtered\_input\_data** (`Dataset`): Dataset after initial metadata filters.
+
+**Returns**
+
+- **Dataset**: Further filtered, sorted, and sliced dataset.
+
+---
+
+### update_perturbation_dictionary
 ```python
 def update_perturbation_dictionary(
     self,
@@ -191,8 +199,8 @@ Append cosine similarity values to a results dictionary.
 
 - **defaultdict**: Updated similarity accumulator.
 
-## Module: perturb_utils.py
-
+---
+### load_and_filter
 ```python
 def load_and_filter(
     filter_data: Optional[Dict[str, List[Any]]],
@@ -215,6 +223,7 @@ Load a Hugging Face dataset and apply metadata filters.
 
 ---
 
+### filter_by_dict
 ```python
 def filter_by_dict(
     data: Dataset,
@@ -236,7 +245,7 @@ Retain only examples matching specified metadata criteria.
 * **Dataset**: Filtered dataset.
 
 ---
-
+### filter_data_by_tokens
 ```python
 def filter_data_by_tokens(
     filtered_input_data: Dataset,
@@ -258,7 +267,7 @@ Keep examples containing all specified token IDs in their `input_ids`.
 * **Dataset**: Subset containing required tokens.
 
 ---
-
+### filter_data_by_tokens_and_log
 ```python
 def filter_data_by_tokens_and_log(
     filtered_input_data: Dataset,
@@ -282,7 +291,7 @@ Filter by tokens and log the remaining count, raising an error if none remain.
 * **Dataset**: Filtered dataset.
 
 ---
-
+### filter_data_by_start_state
 ```python
 def filter_data_by_start_state(
     filtered_input_data: Dataset,
@@ -307,7 +316,7 @@ Restrict data to a specified starting state.
 * **Dataset**: Subset matching the start state.
 
 ---
-
+### slice_by_inds_to_perturb
 ```python
 def slice_by_inds_to_perturb(
     dataset: Dataset,
@@ -327,7 +336,7 @@ Select a contiguous slice of examples by start/end indices.
 * **Dataset**: Sliced dataset.
 
 ---
-
+### load_model
 ```python
 def load_model(
     model_type: str,
@@ -351,7 +360,7 @@ Load a transformer model for evaluation or classification.
 * **nn.Module**: Loaded model on CUDA with appropriate config.
 
 ---
-
+### quant_layers
 ```python
 def quant_layers(
     model: nn.Module
@@ -370,6 +379,7 @@ Count transformer encoder layers in the model.
 
 ---
 
+### get_model_emb_dims
 ```python
 def get_model_emb_dims(
     model: nn.Module
@@ -387,7 +397,7 @@ Get the hidden size (embedding dimension) of the model.
 * **int**: Size of embeddings.
 
 ---
-
+### get_model_input_size
 ```python
 def get_model_input_size(
     model: nn.Module
@@ -405,7 +415,7 @@ Retrieve the maximum sequence length of the model.
 * **int**: Max position embeddings.
 
 ---
-
+### measure_length
 ```python
 def measure_length(
     example: Dict[str, Any]
@@ -423,7 +433,7 @@ Compute and set the `length` field for an example.
 * **Dict\[str, Any]**: Example with updated `length`.
 
 ---
-
+### downsample_and_sort
 ```python
 def downsample_and_sort(
     data: Dataset,
@@ -443,7 +453,7 @@ Randomly downsample up to `max_ncells` and sort by sequence length.
 * **Dataset**: Downsampled, length-sorted dataset.
 
 ---
-
+### stratified_downsample_and_sort
 ```python
 def stratified_downsample_and_sort(
     data: Dataset,
@@ -465,7 +475,7 @@ Perform stratified sampling to reach `max_ncells`, then sort by length.
 * **Dataset**: Stratified, downsampled, sorted dataset.
 
 ---
-
+### forward_pass_single_cell
 ```python
 def forward_pass_single_cell(
     model: nn.Module,
@@ -487,7 +497,7 @@ Extract embeddings for a single example.
 * **torch.Tensor**: Embedding tensor.
 
 ---
-
+### delete_indices
 ```python
 def delete_indices(
     example: Dict[str, Any]
@@ -505,7 +515,7 @@ Remove tokens specified in `example['perturb_index']`.
 * **Dict\[str, Any]**: Example with tokens removed and updated `length`.
 
 ---
-
+### overexpress_indices
 ```python
 def overexpress_indices(
     example: Dict[str, Any]
@@ -523,7 +533,7 @@ Simulate overexpression by duplicating tokens in `perturb_index`.
 * **Dict\[str, Any]**: Example with tokens rearranged and updated `length`.
 
 ---
-
+### make_perturbation_batch
 ```python
 def make_perturbation_batch(
     example_cell: Dict[str, Any],
@@ -552,7 +562,7 @@ Generate a dataset of perturbed examples and corresponding perturbation indices.
 * **List\[List\[int]]**: Indices used for each perturbation.
 
 ---
-
+### make_comparison_batch
 ```python
 def make_comparison_batch(
     original_emb_batch: torch.Tensor,
@@ -574,7 +584,7 @@ Create aligned batches for comparing original and perturbed embeddings.
 * **torch.Tensor**: Embeddings aligned for comparison.
 
 ---
-
+### pad_tensor_list
 ```python
 def pad_tensor_list(
     tensor_list: List[torch.Tensor],
@@ -602,7 +612,7 @@ Pad a list of tensors to a common length.
 * **torch.Tensor**: Stacked tensor batch.
 
 ---
-
+### gen_attention_mask
 ```python
 def gen_attention_mask(
     minibatch_encoding: Dict[str, List[int]],
@@ -622,7 +632,7 @@ Generate attention masks from example lengths.
 * **torch.Tensor**: Attention mask tensor.
 
 ---
-
+### mean_nonpadding_embs
 ```python
 def mean_nonpadding_embs(
     embs: torch.Tensor,
@@ -644,7 +654,7 @@ Compute mean embeddings excluding padded positions.
 * **torch.Tensor**: Mean pooled embeddings.
 
 ---
-
+### quant_cos_sims
 ```python
 def quant_cos_sims(
     perturbation_emb: torch.Tensor,
@@ -671,7 +681,7 @@ Compute cosine similarity shifts between perturbed and original embeddings.
 * **Dict\[str, torch.Tensor]**: Shift maps for `'cell'` mode.
 
 ---
-
+### write_perturbation_dictionary
 ```python
 def write_perturbation_dictionary(
     cos_sims_dict: defaultdict,
@@ -691,7 +701,7 @@ Save raw cosine similarity results to a pickle.
 * `None`
 
 ---
-
+### GeneIdHandler
 ```python
 class GeneIdHandler:
     def __init__(
@@ -723,312 +733,7 @@ Utility to convert between ENSEMBL IDs, tokens, and gene symbols.
 
 * Instance of `GeneIdHandler`.
 
-## Module: perturb\_stats.py
-
-```python
-def invert_dict(
-    dictionary: Dict[Any, Any]
-) -> Dict[Any, Any]
-```
-
-Swap keys and values in a dictionary.
-
-**Parameters**
-
-* **dictionary** (`Dict[Any, Any]`): Original mapping from keys to values.
-
-**Returns**
-
-* **Dict\[Any, Any]**: A new dictionary where each original value is now a key, and each original key is its corresponding value.
-
----
-
-```python
-def read_dict(
-    cos_sims_dict: Dict[Any, Any],
-    cell_or_gene_emb: str,
-    anchor_token: Any
-) -> List[Dict[Any, Any]]
-```
-
-Extract structured cell or gene embedding entries from a raw cosine-similarity dictionary.
-
-**Parameters**
-
-* **cos\_sims\_dict** (`Dict[Any, Any]`): Raw similarity results mapping tokens or token pairs to score lists.
-* **cell\_or\_gene\_emb** (`str`): Mode flag, either `'cell'` or `'gene'`, to select which entries to extract.
-* **anchor\_token** (`Any`): Reference token used when filtering gene-mode entries; if `None`, returns all non-empty gene entries.
-
-**Returns**
-
-* **List\[Dict\[Any, Any]]**: A list containing a single filtered dictionary of embeddings.
-
----
-
-```python
-def read_dictionaries(
-    input_data_directory: str,
-    cell_or_gene_emb: str,
-    anchor_token: Any,
-    cell_states_to_model: Optional[Dict[str, Any]],
-    pickle_suffix: str
-) -> Union[List[Dict[Any, Any]], Dict[Any, Dict[Any, Any]]]
-```
-
-Load and aggregate pickled perturbation result dictionaries.
-
-**Parameters**
-
-* **input\_data\_directory** (`str`): Path to directory containing raw `.pickle` files.
-* **cell\_or\_gene\_emb** (`str`): `'cell'` or `'gene'` mode for entry extraction.
-* **anchor\_token** (`Any`): Token reference for gene-mode filtering; may be `None`.
-* **cell\_states\_to\_model** (`Dict[str, Any]`, optional): Specifies state-key and state values for aggregation; if `None`, returns a flat list.
-* **pickle\_suffix** (`str`): Filename suffix (e.g., `"_raw.pickle"`) to identify relevant files.
-
-**Returns**
-
-* **List\[Dict\[Any, Any]]**: If `cell_states_to_model` is `None`, list of per-file dictionaries.
-* **Dict\[Any, Dict\[Any, Any]]**: If modeling states, maps each state to its aggregated dictionary.
-
----
-
-```python
-def get_gene_list(
-    dict_list: Union[List[Dict[Any, Any]], Dict[Any, Dict[Any, Any]]],
-    mode: str
-) -> List[Any]
-```
-
-Compile a sorted list of unique gene identifiers from aggregated entries.
-
-**Parameters**
-
-* **dict\_list** (`List[Dict]` or `Dict`): Output from `read_dictionaries` containing similarity records.
-* **mode** (`str`): `'cell'` or `'gene'`, to select token position (0 or 1) when extracting keys.
-
-**Returns**
-
-* **List\[Any]**: Sorted list of unique gene tokens or cell identifiers.
-
----
-
-```python
-def token_tuple_to_ensembl_ids(
-    token_tuple: Union[Tuple[int, ...], int],
-    gene_token_id_dict: Dict[int, str]
-) -> Union[Tuple[Optional[str], ...], Optional[str]]
-```
-
-Map one or more token IDs to Ensembl gene IDs using a lookup.
-
-**Parameters**
-
-* **token\_tuple** (`int` or `Tuple[int, ...]`): Single token ID or tuple of token IDs.
-* **gene\_token\_id\_dict** (`Dict[int, str]`): Mapping from token ID to Ensembl ID.
-
-**Returns**
-
-* **Tuple\[str, ...]** or **str**: Corresponding Ensembl IDs, or `None` where no mapping exists.
-
----
-
-```python
-def n_detections(
-    token: int,
-    dict_list: List[Dict[Any, Any]],
-    mode: str,
-    anchor_token: Any
-) -> int
-```
-
-Count total similarity entries for a given token across all dictionaries.
-
-**Parameters**
-
-* **token** (`int`): Token ID to tally.
-* **dict\_list** (`List[Dict]`): List of similarity dictionaries.
-* **mode** (`str`): `'cell'` counts `(token, 'cell_emb')`; `'gene'` counts `(anchor_token, token)`.
-* **anchor\_token** (`Any`): Reference token for gene mode.
-
-**Returns**
-
-* **int**: Total number of detections.
-
----
-
-```python
-def get_fdr(
-    pvalues: Sequence[float]
-) -> List[float]
-```
-
-Adjust a list of p-values for false discovery rate via Benjamini–Hochberg.
-
-**Parameters**
-
-* **pvalues** (`Sequence[float]`): Raw p-values from statistical tests.
-
-**Returns**
-
-* **List\[float]**: FDR-corrected p-values, same order as input.
-
----
-
-```python
-def get_impact_component(
-    test_value: float,
-    gaussian_mixture_model: GaussianMixture
-) -> int
-```
-
-Determine which component (impact vs. non-impact) a value belongs to in a 2-component GMM.
-
-**Parameters**
-
-* **test\_value** (`float`): Observed shift statistic.
-* **gaussian\_mixture\_model** (`GaussianMixture`): Fitted 2-component model.
-
-**Returns**
-
-* **int**: Component index (`0` or `1`) indicating impact group.
-
----
-
-```python
-def isp_aggregate_grouped_perturb(
-    cos_sims_df: pd.DataFrame,
-    dict_list: List[Dict[Any, Any]],
-    genes_perturbed: List[Any]
-) -> pd.DataFrame
-```
-
-Aggregate cosine-shift data for a specific gene or group perturbation across cells.
-
-**Parameters**
-
-* **cos\_sims\_df** (`pd.DataFrame`): DataFrame with columns `'Gene'`, `'Gene_name'`, `'Ensembl_ID'`.
-* **dict\_list** (`List[Dict]`): Similarity dictionaries for each cell.
-* **genes\_perturbed** (`List[Any]`): Gene IDs in the perturbation group.
-
-**Returns**
-
-* **pd.DataFrame**: Concatenated DataFrame with `'Cosine_sim'` and `'Gene'` columns for each perturbation.
-
----
-
-```python
-def find(
-    variable: Any,
-    x: Any
-) -> bool
-```
-
-Utility to test membership or equality robustly.
-
-**Parameters**
-
-* **variable** (`Any`): Value or iterable to search.
-* **x** (`Any`): Element to test for.
-
-**Returns**
-
-* **bool**: `True` if `x` equals or is contained in `variable`, else `False`.
-
----
-
-```python
-def isp_aggregate_gene_shifts(
-    cos_sims_df: pd.DataFrame,
-    dict_list: List[Dict[Any, Any]],
-    gene_token_id_dict: Dict[int, str],
-    gene_id_name_dict: Dict[str, str]
-) -> pd.DataFrame
-```
-
-Summarize mean, standard deviation, and count of cosine shifts per gene.
-
-**Parameters**
-
-* **cos\_sims\_df** (`pd.DataFrame`): Initial gene list DataFrame.
-* **dict\_list** (`List[Dict]`): Similarity dictionaries.
-* **gene\_token\_id\_dict** (`Dict[int, str]`): Token→Ensembl ID mapping.
-* **gene\_id\_name\_dict** (`Dict[str, str]`): Ensembl ID→gene name mapping.
-
-**Returns**
-
-* **pd.DataFrame**: Table with columns `['Perturbed','Gene_name','Ensembl_ID','Affected','Affected_gene_name','Affected_Ensembl_ID','Cosine_sim_mean','Cosine_sim_stdev','N_Detections']`.
-
----
-
-```python
-def isp_stats_to_goal_state(
-    cos_sims_df: pd.DataFrame,
-    result_dict: Dict[Any, List[float]],
-    cell_states_to_model: Dict[str, Any],
-    genes_perturbed: Union[str, List[Any]]
-) -> pd.DataFrame
-```
-
-Compute shifts for perturbations toward goal vs. alternate or random states.
-
-**Parameters**
-
-* **cos\_sims\_df** (`pd.DataFrame`): Base gene list DataFrame.
-* **result\_dict** (`Dict`): Aggregated similarity lists keyed by state.
-* **cell\_states\_to\_model** (`Dict[str, Any]`): Contains `'state_key','start_state','goal_state','alt_states'`.
-* **genes\_perturbed** (`'all'` or `List[Any]`): Genes tested.
-
-**Returns**
-
-* **pd.DataFrame**: Shifts and p-values (and FDR) for goal and alternate states.
-
----
-
-```python
-def isp_stats_vs_null(
-    cos_sims_df: pd.DataFrame,
-    dict_list: List[Dict[Any, Any]],
-    null_dict_list: List[Dict[Any, Any]]
-) -> pd.DataFrame
-```
-
-Compare perturbation shifts against a null distribution.
-
-**Parameters**
-
-* **cos\_sims\_df** (`pd.DataFrame`): Base gene list DataFrame.
-* **dict\_list** (`List[Dict]`): Test similarity dictionaries.
-* **null\_dict\_list** (`List[Dict]`): Null similarity dictionaries.
-
-**Returns**
-
-* **pd.DataFrame**: Test vs. null shifts, p-values, and FDR in columns `['Test_avg_shift','Null_avg_shift','Test_vs_null_avg_shift','Test_vs_null_pval','Test_vs_null_FDR','Sig']`.
-
----
-
-```python
-def isp_stats_mixture_model(
-    cos_sims_df: pd.DataFrame,
-    dict_list: List[Dict[Any, Any]],
-    combos: int,
-    anchor_token: Any
-) -> pd.DataFrame
-```
-
-Fit a 2-component GMM to identify impact vs. non-impact perturbations.
-
-**Parameters**
-
-* **cos\_sims\_df** (`pd.DataFrame`): Base gene list DataFrame.
-* **dict\_list** (`List[Dict]`): Similarity dictionaries.
-* **combos** (`int`): 0 for single-gene, 1 for pairwise perturbations.
-* **anchor\_token** (`Any`): Reference token for combos.
-
-**Returns**
-
-* **pd.DataFrame**: GMM component assignments and related statistics, including `['Impact_component','Impact_component_percent','N_Detections']`.
-
----
+## Perturb Stats
 
 ### Class: InSilicoPerturberStats
 
@@ -1104,3 +809,313 @@ Map a token ID or tuple of IDs to gene symbol(s).
 **Returns**
 
 * **str** or **Tuple\[str, ...]**: Corresponding gene symbol(s).
+
+---
+### n_detections
+```python
+def n_detections(
+    token: int,
+    dict_list: List[Dict[Any, Any]],
+    mode: str,
+    anchor_token: Any
+) -> int
+```
+
+Count total similarity entries for a given token across all dictionaries.
+
+**Parameters**
+
+* **token** (`int`): Token ID to tally.
+* **dict\_list** (`List[Dict]`): List of similarity dictionaries.
+* **mode** (`str`): `'cell'` counts `(token, 'cell_emb')`; `'gene'` counts `(anchor_token, token)`.
+* **anchor\_token** (`Any`): Reference token for gene mode.
+
+**Returns**
+
+* **int**: Total number of detections.
+
+---
+### get_fdr
+```python
+def get_fdr(
+    pvalues: Sequence[float]
+) -> List[float]
+```
+
+Adjust a list of p-values for false discovery rate via Benjamini–Hochberg.
+
+**Parameters**
+
+* **pvalues** (`Sequence[float]`): Raw p-values from statistical tests.
+
+**Returns**
+
+* **List\[float]**: FDR-corrected p-values, same order as input.
+
+---
+### get_impact_component
+```python
+def get_impact_component(
+    test_value: float,
+    gaussian_mixture_model: GaussianMixture
+) -> int
+```
+
+Determine which component (impact vs. non-impact) a value belongs to in a 2-component GMM.
+
+**Parameters**
+
+* **test\_value** (`float`): Observed shift statistic.
+* **gaussian\_mixture\_model** (`GaussianMixture`): Fitted 2-component model.
+
+**Returns**
+
+* **int**: Component index (`0` or `1`) indicating impact group.
+
+---
+
+### find
+```python
+def find(
+    variable: Any,
+    x: Any
+) -> bool
+```
+
+Utility to test membership or equality robustly.
+
+**Parameters**
+
+* **variable** (`Any`): Value or iterable to search.
+* **x** (`Any`): Element to test for.
+
+**Returns**
+
+* **bool**: `True` if `x` equals or is contained in `variable`, else `False`.
+
+---
+
+### isp_aggregate_grouped_perturb
+```python
+def isp_aggregate_grouped_perturb(
+    cos_sims_df: pd.DataFrame,
+    dict_list: List[Dict[Any, Any]],
+    genes_perturbed: List[Any]
+) -> pd.DataFrame
+```
+
+Aggregate cosine-shift data for a specific gene or group perturbation across cells.
+
+**Parameters**
+
+* **cos\_sims\_df** (`pd.DataFrame`): DataFrame with columns `'Gene'`, `'Gene_name'`, `'Ensembl_ID'`.
+* **dict\_list** (`List[Dict]`): Similarity dictionaries for each cell.
+* **genes\_perturbed** (`List[Any]`): Gene IDs in the perturbation group.
+
+**Returns**
+
+* **pd.DataFrame**: Concatenated DataFrame with `'Cosine_sim'` and `'Gene'` columns for each perturbation.
+
+---
+### isp_aggregate_gene_shifts
+```python
+def isp_aggregate_gene_shifts(
+    cos_sims_df: pd.DataFrame,
+    dict_list: List[Dict[Any, Any]],
+    gene_token_id_dict: Dict[int, str],
+    gene_id_name_dict: Dict[str, str]
+) -> pd.DataFrame
+```
+
+Summarize mean, standard deviation, and count of cosine shifts per gene.
+
+**Parameters**
+
+* **cos\_sims\_df** (`pd.DataFrame`): Initial gene list DataFrame.
+* **dict\_list** (`List[Dict]`): Similarity dictionaries.
+* **gene\_token\_id\_dict** (`Dict[int, str]`): Token→Ensembl ID mapping.
+* **gene\_id\_name\_dict** (`Dict[str, str]`): Ensembl ID→gene name mapping.
+
+**Returns**
+
+* **pd.DataFrame**: Table with columns `['Perturbed','Gene_name','Ensembl_ID','Affected','Affected_gene_name','Affected_Ensembl_ID','Cosine_sim_mean','Cosine_sim_stdev','N_Detections']`.
+
+---
+### isp_stats_to_goal_state
+```python
+def isp_stats_to_goal_state(
+    cos_sims_df: pd.DataFrame,
+    result_dict: Dict[Any, List[float]],
+    cell_states_to_model: Dict[str, Any],
+    genes_perturbed: Union[str, List[Any]]
+) -> pd.DataFrame
+```
+
+Compute shifts for perturbations toward goal vs. alternate or random states.
+
+**Parameters**
+
+* **cos\_sims\_df** (`pd.DataFrame`): Base gene list DataFrame.
+* **result\_dict** (`Dict`): Aggregated similarity lists keyed by state.
+* **cell\_states\_to\_model** (`Dict[str, Any]`): Contains `'state_key','start_state','goal_state','alt_states'`.
+* **genes\_perturbed** (`'all'` or `List[Any]`): Genes tested.
+
+**Returns**
+
+* **pd.DataFrame**: Shifts and p-values (and FDR) for goal and alternate states.
+
+---
+### isp_stats_vs_null
+```python
+def isp_stats_vs_null(
+    cos_sims_df: pd.DataFrame,
+    dict_list: List[Dict[Any, Any]],
+    null_dict_list: List[Dict[Any, Any]]
+) -> pd.DataFrame
+```
+
+Compare perturbation shifts against a null distribution.
+
+**Parameters**
+
+* **cos\_sims\_df** (`pd.DataFrame`): Base gene list DataFrame.
+* **dict\_list** (`List[Dict]`): Test similarity dictionaries.
+* **null\_dict\_list** (`List[Dict]`): Null similarity dictionaries.
+
+**Returns**
+
+* **pd.DataFrame**: Test vs. null shifts, p-values, and FDR in columns `['Test_avg_shift','Null_avg_shift','Test_vs_null_avg_shift','Test_vs_null_pval','Test_vs_null_FDR','Sig']`.
+
+---
+### isp_stats_mixture_model
+```python
+def isp_stats_mixture_model(
+    cos_sims_df: pd.DataFrame,
+    dict_list: List[Dict[Any, Any]],
+    combos: int,
+    anchor_token: Any
+) -> pd.DataFrame
+```
+
+Fit a 2-component GMM to identify impact vs. non-impact perturbations.
+
+**Parameters**
+
+* **cos\_sims\_df** (`pd.DataFrame`): Base gene list DataFrame.
+* **dict\_list** (`List[Dict]`): Similarity dictionaries.
+* **combos** (`int`): 0 for single-gene, 1 for pairwise perturbations.
+* **anchor\_token** (`Any`): Reference token for combos.
+
+**Returns**
+
+* **pd.DataFrame**: GMM component assignments and related statistics, including `['Impact_component','Impact_component_percent','N_Detections']`.
+
+---
+
+
+### invert_dict
+```python
+def invert_dict(
+    dictionary: Dict[Any, Any]
+) -> Dict[Any, Any]
+```
+
+Swap keys and values in a dictionary.
+
+**Parameters**
+
+* **dictionary** (`Dict[Any, Any]`): Original mapping from keys to values.
+
+**Returns**
+
+* **Dict\[Any, Any]**: A new dictionary where each original value is now a key, and each original key is its corresponding value.
+
+---
+### read_dict
+```python
+def read_dict(
+    cos_sims_dict: Dict[Any, Any],
+    cell_or_gene_emb: str,
+    anchor_token: Any
+) -> List[Dict[Any, Any]]
+```
+
+Extract structured cell or gene embedding entries from a raw cosine-similarity dictionary.
+
+**Parameters**
+
+* **cos\_sims\_dict** (`Dict[Any, Any]`): Raw similarity results mapping tokens or token pairs to score lists.
+* **cell\_or\_gene\_emb** (`str`): Mode flag, either `'cell'` or `'gene'`, to select which entries to extract.
+* **anchor\_token** (`Any`): Reference token used when filtering gene-mode entries; if `None`, returns all non-empty gene entries.
+
+**Returns**
+
+* **List\[Dict\[Any, Any]]**: A list containing a single filtered dictionary of embeddings.
+
+---
+### read_dictionaries
+```python
+def read_dictionaries(
+    input_data_directory: str,
+    cell_or_gene_emb: str,
+    anchor_token: Any,
+    cell_states_to_model: Optional[Dict[str, Any]],
+    pickle_suffix: str
+) -> Union[List[Dict[Any, Any]], Dict[Any, Dict[Any, Any]]]
+```
+
+Load and aggregate pickled perturbation result dictionaries.
+
+**Parameters**
+
+* **input\_data\_directory** (`str`): Path to directory containing raw `.pickle` files.
+* **cell\_or\_gene\_emb** (`str`): `'cell'` or `'gene'` mode for entry extraction.
+* **anchor\_token** (`Any`): Token reference for gene-mode filtering; may be `None`.
+* **cell\_states\_to\_model** (`Dict[str, Any]`, optional): Specifies state-key and state values for aggregation; if `None`, returns a flat list.
+* **pickle\_suffix** (`str`): Filename suffix (e.g., `"_raw.pickle"`) to identify relevant files.
+
+**Returns**
+
+* **List\[Dict\[Any, Any]]**: If `cell_states_to_model` is `None`, list of per-file dictionaries.
+* **Dict\[Any, Dict\[Any, Any]]**: If modeling states, maps each state to its aggregated dictionary.
+
+---
+### get_gene_list
+```python
+def get_gene_list(
+    dict_list: Union[List[Dict[Any, Any]], Dict[Any, Dict[Any, Any]]],
+    mode: str
+) -> List[Any]
+```
+
+Compile a sorted list of unique gene identifiers from aggregated entries.
+
+**Parameters**
+
+* **dict\_list** (`List[Dict]` or `Dict`): Output from `read_dictionaries` containing similarity records.
+* **mode** (`str`): `'cell'` or `'gene'`, to select token position (0 or 1) when extracting keys.
+
+**Returns**
+
+* **List\[Any]**: Sorted list of unique gene tokens or cell identifiers.
+
+---
+### token_tuple_to_ensembl_ids
+```python
+def token_tuple_to_ensembl_ids(
+    token_tuple: Union[Tuple[int, ...], int],
+    gene_token_id_dict: Dict[int, str]
+) -> Union[Tuple[Optional[str], ...], Optional[str]]
+```
+
+Map one or more token IDs to Ensembl gene IDs using a lookup.
+
+**Parameters**
+
+* **token\_tuple** (`int` or `Tuple[int, ...]`): Single token ID or tuple of token IDs.
+* **gene\_token\_id\_dict** (`Dict[int, str]`): Mapping from token ID to Ensembl ID.
+
+**Returns**
+
+* **Tuple\[str, ...]** or **str**: Corresponding Ensembl IDs, or `None` where no mapping exists.
+

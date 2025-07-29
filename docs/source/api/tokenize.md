@@ -1,4 +1,4 @@
-# Spatial Transcriptomics Tokenization & Embedding API
+# Spatial Tokenize
 
 ## Overview
 
@@ -228,7 +228,7 @@ Tokenize all `.h5ad` or `.loom` files in the given directory.
 
 Extracts embeddings from tokenized inputs using Geneformer models.
 
-### `__init__`
+### class: EmbExtractor
 
 ```python
 EmbExtractor(
@@ -321,3 +321,4 @@ Generate UMAP or heatmap plots for embeddings.
 **Returns:**
 
 - `None`
+

@@ -4,9 +4,9 @@ API REFERENCE
 
 .. toctree::
     :maxdepth: 1
-
-    classification
-    perturbation
+    
     tokenize
     pretraining
+    classification
+    perturbation
     grn

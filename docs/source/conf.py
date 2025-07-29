@@ -9,6 +9,9 @@ author = 'Ivy Strope'
 release = '0.1'
 version = '0.1.0'
 
+repository_url='https://github.com/istrope/CancerStFormer'
+
+
 # -- General configuration
 
 extensions = [

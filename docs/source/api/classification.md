@@ -1,26 +1,5 @@
-## Module: classifier.py
+## Classifier
 
-```python
-build_custom_tokenizer(
-    token_dict_path: str,
-    pad_token: str = "<pad>",
-    mask_token: str = "<mask>"
-) -> PreTrainedTokenizerFast
-```
-Build a Hugging Face tokenizer from a pickled vocabulary.
-
-**Description**  
-Loads a token-to-ID mapping from a pickle file and instantiates a `PreTrainedTokenizerFast` with custom special tokens.
-
-**Parameters**  
-- **token_dict_path** (`str`): Path to a pickle file containing a `dict[str, int]` vocabulary.  
-- **pad_token** (`str`, default `"<pad>"`): Token used for padding sequences.  
-- **mask_token** (`str`, default `"<mask>"`): Token used to mark masked positions.
-
-**Returns**  
-- **PreTrainedTokenizerFast**: Tokenizer configured with `<unk>`, `<cls>`, `<sep>`, plus the provided pad/mask tokens.
-
----
 
 ### class GenericClassifier
 
@@ -255,8 +234,32 @@ Delegate prediction summary plotting to utility functions.
 **Returns**  
 - `None`
 
-## Module: classifier\_utils.py
+---
+### build_custom_tokenizer
+```python
+build_custom_tokenizer(
+    token_dict_path: str,
+    pad_token: str = "<pad>",
+    mask_token: str = "<mask>"
+) -> PreTrainedTokenizerFast
+```
+Build a Hugging Face tokenizer from a pickled vocabulary.
 
+**Description**  
+Loads a token-to-ID mapping from a pickle file and instantiates a `PreTrainedTokenizerFast` with custom special tokens.
+
+**Parameters**  
+- **token_dict_path** (`str`): Path to a pickle file containing a `dict[str, int]` vocabulary.  
+- **pad_token** (`str`, default `"<pad>"`): Token used for padding sequences.  
+- **mask_token** (`str`, default `"<mask>"`): Token used to mark masked positions.
+
+**Returns**  
+- **PreTrainedTokenizerFast**: Tokenizer configured with `<unk>`, `<cls>`, `<sep>`, plus the provided pad/mask tokens.
+
+
+## Classifier Utility Functions
+
+### load_and_filter
 ```python
 load_and_filter(
     filter_data: Optional[dict],
@@ -281,7 +284,7 @@ If `input_data` is a string path, loads the dataset via `load_from_disk`; otherw
 * **Dataset**: Filtered Hugging Face `Dataset`.
 
 ---
-
+### remove_rare
 ```python
 remove_rare(
     data: Dataset,
@@ -308,7 +311,7 @@ Computes the frequency of each value in `state_key`. Drops values whose count di
 * **Dataset**: Dataset with rare-label examples removed.
 
 ---
-
+### downsample_and_shuffle
 ```python
 downsample_and_shuffle(
     data: Dataset,
@@ -335,7 +338,7 @@ Shuffles examples with a fixed seed, selects up to `max_ncells` total examples, 
 * **Dataset**: Downsampled and shuffled dataset.
 
 ---
-
+### subsample_by_class
 ```python
 subsample_by_class(
     labels: Sequence,
@@ -358,7 +361,7 @@ Groups indices by label, then randomly samples up to N for each group.
 * **List\[int]**: Selected example indices.
 
 ---
-
+### rename_cols
 ```python
 rename_cols(
     data: Dataset,
@@ -381,7 +384,7 @@ Renames the column named by `state_key` to `"label"`.
 * **Dataset**: Dataset with `state_key` renamed to `label`.
 
 ---
-
+### flatten_list
 ```python
 flatten_list(
     l: Sequence[Sequence]
@@ -399,7 +402,7 @@ Flatten a list of lists into a single list.
 * **List\[Any]**: Flat list containing all items.
 
 ---
-
+### label_classes
 ```python
 label_classes(
     classifier: str,
@@ -430,7 +433,7 @@ Map string labels to integer class IDs for cell- or gene-level classification.
 * **Tuple\[Dataset, dict]**: Labeled dataset and mapping of class names to integer IDs.
 
 ---
-
+### predict_from_checkpoint
 ```python
 predict_from_checkpoint(
     model_dir: str,
@@ -462,6 +465,9 @@ Loads tokenizer and model (sequence or token), constructs a `Trainer`, and retur
 
 ---
 
+## Data Collators
+
+### class: DataCollatorForCellClassification
 ```python
 class DataCollatorForCellClassification(DataCollatorWithPadding):
     def __init__(self, tokenizer, padding: str = "max_length", max_length: int = 2048)
@@ -484,7 +490,7 @@ Inherits from `DataCollatorWithPadding`; pops each example’s `label`, pads inp
 * **Dict\[str, torch.Tensor]**: Batch dict with `input_ids`, `attention_mask`, and `labels`.
 
 ---
-
+### class DataCollatorForGeneClassification
 ```python
 class DataCollatorForGeneClassification:
     def __init__(
@@ -514,3 +520,4 @@ Uses `tokenizer.pad()` to pad `input_ids` and `attention_mask`, then pads each f
 **Returns**
 
 * **Dict\[str, torch.Tensor]**: Batch dict with padded `input_ids`, `attention_mask`, and `labels`.
+
