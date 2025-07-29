@@ -2,8 +2,6 @@
 
 ## Classifier
 
-### class: GenericClassifier
-
 ```python
 class GenericClassifier:
     def __init__(
@@ -47,7 +45,7 @@ Stores settings for data filtering, label mapping, training arguments (with defa
 
 ---
 
-#### load_tokenizer
+### load_tokenizer
 
 ```python
 _load_tokenizer(
@@ -67,7 +65,7 @@ Determines if `name_or_path` points to a pickle (custom vocab) or a standard pre
 
 ---
 
-#### ray_tune
+### ray_tune
 
 ```python
 _ray_tune(
@@ -158,9 +156,9 @@ Auto-splits train/test if needed, loads datasets, configures tokenizer and colla
 
 ---
 
-### Predictions
+## Predictions
 
-#### evaluate
+### evaluate
 
 ```python
 evaluate(
@@ -187,7 +185,7 @@ Loads model, tokenizer, and dataset, sets up a `Trainer`, runs evaluation, and l
 - **dict**: Evaluation metrics from `Trainer.evaluate()`.
 
 ---
-#### plot_confusion_matrix
+### plot_confusion_matrix
 
 ```python
 plot_confusion_matrix(
@@ -211,7 +209,7 @@ Delegate confusion matrix plotting to utility functions.
 
 ---
 
-#### plot_predictions
+### plot_predictions
 
 ```python
 plot_predictions(
@@ -239,6 +237,10 @@ Delegate prediction summary plotting to utility functions.
 
 ---
 
+
+## Classifier Utility Functions
+
+
 ### build_custom_tokenizer
 ```python
 build_custom_tokenizer(
@@ -259,9 +261,7 @@ Loads a token-to-ID mapping from a pickle file and instantiates a `PreTrainedTok
 
 **Returns**  
 - **PreTrainedTokenizerFast**: Tokenizer configured with `<unk>`, `<cls>`, `<sep>`, plus the provided pad/mask tokens.
-
-
-## Classifier Utility Functions
+---
 
 ### load_and_filter
 ```python
