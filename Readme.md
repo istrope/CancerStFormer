@@ -12,7 +12,7 @@ conda activate cstformer
 # Install dependencies
 pip install torch
 pip install -r requirements.txt
-pip install cstformer
+pip install CancerstFormer
 
 # if using deepspeed:
 pip install mpi4py, deepspeed
