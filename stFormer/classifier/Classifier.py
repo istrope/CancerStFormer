@@ -50,6 +50,7 @@ import os
 import pickle
 import logging
 from pathlib import Path
+from datasets import Value
 import torch
 torch.backends.cudnn.benchmark = True
 from datasets import load_from_disk
@@ -66,7 +67,7 @@ from transformers import (
 
 import stFormer.classifier.classifier_utils as cu
 import stFormer.classifier.evaluation_utils as eu
-from stFormer.classifier.classifier_utils import DataCollatorForGeneClassification
+from stFormer.classifier.classifier_utils import DataCollatorForGeneClassification, DataCollatorForCellClassification
 
 logger = logging.getLogger(__name__)
 logging.getLogger("transformers.modeling_utils").setLevel(logging.ERROR)
@@ -80,6 +81,7 @@ def build_custom_tokenizer(token_dict_path: str,
         vocab = pickle.load(f)
     tokenizer = PreTrainedTokenizerFast(
         vocab=vocab,
+        merges = [],
         unk_token="<unk>",
         pad_token=pad_token,
         mask_token=mask_token,
@@ -111,7 +113,7 @@ class GenericClassifier:
         "lr_scheduler_type":"cosine",
         'warmup_ratio': 0.1,
         # training length
-        "num_train_epochs": 3,
+        "num_train_epochs": 2,
         "weight_decay":     0.0,
         # precision & performance
         "fp16": True,         # or bf16 if supported
@@ -120,7 +122,8 @@ class GenericClassifier:
         # checkpoint
         "save_total_limit": 2,
         "load_best_model_at_end": True,
-        "metric_for_best_model": "eval_loss",
+        "metric_for_best_model": "eval_accuracy",
+        'greater_is_better': True
     }
 
     def __init__(
@@ -137,7 +140,7 @@ class GenericClassifier:
         training_args=None,
         ray_config=None,
         freeze_layers=0,
-        forward_batch_size=32,
+        forward_batch_size=48,
         nproc=4
     ):
         self.metadata_column = metadata_column
@@ -160,14 +163,14 @@ class GenericClassifier:
             raise Exception('If using gene classifier, please provide token dictionary file for mapping')
         self.token_dictionary_file = token_dictionary_file
 
-    def prepare_data(self, input_data_file, output_directory, output_prefix):
+    def prepare_data(self, input_data, output_directory, output_prefix):
         """
         Prepare dataset: filter, downsample, map metadata to 'label', and save.
 
         Returns:
             tuple(str, str): Paths to saved dataset and label mapping.
         """
-        data = cu.load_and_filter(self.filter_data, self.nproc, input_data_file)
+        data = cu.load_and_filter(self.filter_data, self.nproc, input_data)
         os.makedirs(output_directory,exist_ok=True)
 
         if self.classifier_type == 'sequence':
@@ -209,7 +212,7 @@ class GenericClassifier:
     
     def _load_tokenizer(self, name_or_path):
         p = Path(name_or_path)
-        if p.suffix == '.pkl' and p.exists():
+        if p.suffix in ['.pickle','.pkl'] and p.exists():
             return build_custom_tokenizer(str(p))
         try:
             return AutoTokenizer.from_pretrained(name_or_path)
@@ -221,7 +224,7 @@ class GenericClassifier:
         model_checkpoint,
         dataset_path,
         output_directory,
-        eval_dataset_path=None,
+        eval_dataset=None,
         n_trials: int = 0,
         test_size: float = 0.2,
         tokenizer_name_or_path: str = None
@@ -237,27 +240,29 @@ class GenericClassifier:
                 model_checkpoint,
                 dataset_path,
                 output_directory,
-                eval_dataset_path,
+                eval_dataset,
                 n_trials,
-                test_size
+                test_size,
+                tokenizer_name_or_path
             )
         split_args = { 'test_size': test_size, 'seed': 42 }
         # Load primary dataset
         train_ds = load_from_disk(dataset_path)
         # Auto-split if no separate eval dataset
-        if eval_dataset_path:
-            eval_ds = load_from_disk(eval_dataset_path)
+        if eval_dataset:
+            if isinstance(eval_dataset,str): #load from disk if not already HF Dataset
+                eval_dataset = load_from_disk(eval_dataset)
         else:
             ds = train_ds.train_test_split(**split_args)
             train_ds = ds['train']
-            eval_ds = ds['test']
+            eval_dataset = ds['test']
 
         os.makedirs(output_directory, exist_ok=True)
         # Prepare collator and tokenizer
         tok_src = tokenizer_name_or_path or model_checkpoint
         tokenizer = self._load_tokenizer(tok_src)
         if self.classifier_type == 'sequence':
-            collator = DataCollatorWithPadding(
+            collator = DataCollatorForCellClassification(
                 tokenizer,
                 padding='max_length',
                 max_length=tokenizer.model_max_length
@@ -274,7 +279,7 @@ class GenericClassifier:
         assert num_labels > 0, 'No class labels found, did you run prepare_data?'
         cols = ['input_ids'] + (['label'] if self.classifier_type=='sequence' else ['labels'])
         train_ds.set_format(type='torch', columns=cols)
-        eval_ds.set_format(type='torch', columns=cols)
+        eval_dataset.set_format(type='torch', columns=cols)
 
         train_batch_size = int(self.forward_batch_size / 2) if (self.forward_batch_size /2) != 0.5 else 1 
         args = TrainingArguments(
@@ -288,14 +293,20 @@ class GenericClassifier:
         # Model init
         config = AutoConfig.from_pretrained(
             model_checkpoint,
+            vocab_size=len(tokenizer),
             num_labels=num_labels,          
         )
+        print(f"Using model checkpoint: {model_checkpoint}")
+        print(f"Number of labels from data: {num_labels}")
+        print(f"Label mapping: {self.label_mapping}")
         model = ModelClass.from_pretrained(
             model_checkpoint,
             config=config,
             ignore_mismatched_sizes=True
         )
-        model.to('cpu')
+        print(model.classifier)
+
+        model.to(device)
 
         if self.freeze_layers > 0 and hasattr(model, 'bert'):
             for l in model.bert.encoder.layer[:self.freeze_layers]:
@@ -305,15 +316,22 @@ class GenericClassifier:
             model=model,
             args=args,
             train_dataset=train_ds,
-            eval_dataset=eval_ds,
+            eval_dataset=eval_dataset,
             compute_metrics=eu.compute_metrics,
             data_collator=collator
         )
-        trainer.train()
+        print("Max label:", max(train_ds['label'] if self.classifier_type == 'sequence' else [l for ex in ds['labels'] for l in ex]))
+        print("Label mapping size:", len(self.label_mapping))
+
+        try:
+            trainer.train()
+        except RuntimeError as e:
+            print('Runtime error during training')
+            print(e)
         torch.cuda.empty_cache()
         tokenizer.save_pretrained(os.path.join(output_directory,'final_model'))
         trainer.save_model(os.path.join(output_directory, 'final_model'))
-        pred = trainer.predict(eval_ds)
+        pred = trainer.predict(eval_dataset)
         with open(os.path.join(output_directory,'predictions.pkl'),'wb') as f:
             pickle.dump(pred,f)
 
@@ -326,7 +344,8 @@ class GenericClassifier:
         output_directory,
         eval_dataset_path,
         n_trials,
-        test_size
+        test_size,
+        tokenizer_name_or_path
     ):
         import os
         from pathlib import Path
@@ -336,162 +355,149 @@ class GenericClassifier:
         from ray.tune import CLIReporter
         from datasets import load_from_disk
         import torch
-        from transformers import (
-            AutoTokenizer,
-            BertForSequenceClassification,
-            DataCollatorWithPadding,
-            Trainer,
-            TrainingArguments
-        )
         import stFormer.classifier.evaluation_utils as eu
+        from transformers import (
+            AutoConfig,
+            TrainingArguments,
+            Trainer
+        )
 
-        #  Normalize and resolve paths 
+        # Normalize paths
         ckpt = Path(model_checkpoint)
-        if ckpt.exists():
-            model_checkpoint = str(ckpt.resolve())
-            local_files_only = True
-        else:
-            local_files_only = False  
+        model_checkpoint = str(ckpt.resolve()) if ckpt.exists() else model_checkpoint
+        local_files_only = ckpt.exists()
 
-        outd = Path(output_directory)
-        outd.mkdir(parents=True, exist_ok=True)
-        output_directory = str(outd.resolve())
+        output_directory = str(Path(output_directory).resolve())
+        os.makedirs(output_directory, exist_ok=True)
 
-        #  Environment setup 
-        GPU_COUNT = torch.cuda.device_count()
-        os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(str(i) for i in range(GPU_COUNT))
-        os.environ["NCCL_DEBUG"] = "INFO"
-        os.environ["CONDA_OVERRIDE_GLIBC"] = "2.56"
-
-        #  Initialize Ray 
         ray.shutdown()
         ray.init(ignore_reinit_error=True)
 
-        #  Load & split data 
-        split_args = { 'test_size': test_size, 'seed': 42 }
+        # Load datasets
         train_ds = load_from_disk(dataset_path)
         if eval_dataset_path:
-            eval_ds = load_from_disk(eval_dataset_path)
+            eval_dataset = load_from_disk(eval_dataset_path)
         else:
-            ds = train_ds.train_test_split(**split_args)
-            train_ds, eval_ds = ds["train"], ds["test"]
+            ds = train_ds.train_test_split(test_size=test_size, seed=42)
+            train_ds, eval_dataset = ds["train"], ds["test"]
 
-        #  HyperOpt search space 
-        space = {}
+        # Format datasets
+        num_labels = len(self.label_mapping)
+        assert num_labels > 0, 'No class labels found, did you run prepare_data?'
+        cols = ['input_ids'] + (['label'] if self.classifier_type == 'sequence' else ['labels'])
+        train_ds.set_format(type='torch', columns=cols)
+        eval_dataset.set_format(type='torch', columns=cols)
+
+        # Load tokenizer and collator
+        tok_src = tokenizer_name_or_path or model_checkpoint
+        tokenizer = self._load_tokenizer(tok_src)
+        if self.classifier_type == 'sequence':
+            collator = DataCollatorForCellClassification(tokenizer, padding="max_length", max_length=tokenizer.model_max_length)
+            ModelClass = AutoModelForSequenceClassification
+        else:
+            collator = DataCollatorForGeneClassification(tokenizer, padding="max_length", max_length=tokenizer.model_max_length)
+            ModelClass = AutoModelForTokenClassification
+
+        # Hyperparameter search space
         rc = self.ray_config or {}
+        space = {}
         if "learning_rate" in rc:
-            space["learning_rate"] = tune.loguniform(rc["learning_rate"][0], rc["learning_rate"][1])
+            space["learning_rate"] = tune.loguniform(*rc["learning_rate"])
         if "num_train_epochs" in rc:
             space["num_train_epochs"] = tune.choice(rc["num_train_epochs"])
+        if "warmup_ratio" in rc:
+            space["warmup_ratio"] = tune.uniform(*rc['warmup_ratio'])
         if "weight_decay" in rc:
-            space["weight_decay"] = tune.uniform(rc["weight_decay"][0], rc["weight_decay"][1])
+            space["weight_decay"] = tune.uniform(*rc["weight_decay"])
         if "lr_scheduler_type" in rc:
             space["lr_scheduler_type"] = tune.choice(rc["lr_scheduler_type"])
         if "warmup_steps" in rc:
-            space["warmup_steps"] = tune.uniform(rc["warmup_steps"][0], rc["warmup_steps"][1])
+            space["warmup_steps"] = tune.uniform(*rc["warmup_steps"])
         if "seed" in rc:
-            space["seed"] = tune.uniform(rc["seed"][0], rc["seed"][1])
+            space["seed"] = tune.uniform(*rc["seed"])
+        if "per_device_train_batch_size" in rc:
+            space["per_device_train_batch_size"] = tune.choice(rc["per_device_train_batch_size"])
 
-        #  Model init function 
+        config = AutoConfig.from_pretrained(
+            model_checkpoint,
+            vocab_size=len(tokenizer),
+            num_labels=num_labels,          
+        ) 
+        # Model init
         def model_init():
-            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
             config = AutoConfig.from_pretrained(
                 model_checkpoint,
-                num_labels=len(self.label_mapping),  # override the final head size to match our sequence (different classification task)
+                vocab_size=len(tokenizer),
+                num_labels=num_labels
             )
-            model = AutoModelForSequenceClassification.from_pretrained(
+            model = ModelClass.from_pretrained(
                 model_checkpoint,
                 config=config,
-                local_files_only=True,
-                ignore_mismatched_sizes=True # if you're replacing an old head
+                local_files_only=local_files_only,
+                ignore_mismatched_sizes=True
             )
-            if self.freeze_layers:
-                for layer in model.bert.encoder.layer[: self.freeze_layers]:
-                    for p in layer.parameters():
+            if self.freeze_layers > 0 and hasattr(model, 'bert'):
+                for l in model.bert.encoder.layer[:self.freeze_layers]:
+                    for p in l.parameters():
                         p.requires_grad = False
-            return model.to(device)
+            return model
 
-        #  Tokenizer & collator 
-        tokenizer = AutoTokenizer.from_pretrained(
-            model_checkpoint,
-            local_files_only=local_files_only
-        )
-        collator = DataCollatorWithPadding(
-            tokenizer,
-            padding="max_length",
-            max_length=tokenizer.model_max_length
-        )
-
-        #  Reporter for CLI progress 
-        reporter = CLIReporter(
-            parameter_columns=list(space.keys()),
-            metric_columns=["eval_loss", "eval_accuracy"],
-            max_report_frequency=600,
-            max_progress_rows=100,
-            sort_by_metric=False,
-            mode="min"
-        )
-
-        #  Base TrainingArguments 
+        # Trainer setup
         base_args = dict(self.training_args)
         base_args.update({
             "output_dir": output_directory,
-            "eval_strategy": "steps",
-            "save_strategy": "steps",
-            "eval_steps": base_args.get("logging_steps", 500),
-            "save_steps": base_args.get("logging_steps", 500),
             "load_best_model_at_end": True,
             "per_device_eval_batch_size": self.forward_batch_size
         })
-        args = TrainingArguments(**base_args)
+        args = TrainingArguments(**base_args,
+                                 disable_tqdm=True)
 
-        #  Build Trainer & HP Search 
         trainer = Trainer(
             model_init=model_init,
             args=args,
             train_dataset=train_ds,
-            eval_dataset=eval_ds,
-            tokenizer=tokenizer,
+            eval_dataset=eval_dataset,
             data_collator=collator,
             compute_metrics=eu.compute_metrics,
+            tokenizer=tokenizer
         )
 
-        hyperopt_search = HyperOptSearch(metric="eval_loss", mode="min")
+        reporter = CLIReporter(
+            parameter_columns=list(space.keys()),
+            metric_columns=["eval_loss", "eval_accuracy"],
+            sort_by_metric=False,
+            mode="min"
+        )
+
         best = trainer.hyperparameter_search(
             hp_space=lambda _: space,
             backend="ray",
-            search_alg=hyperopt_search,
+            search_alg=HyperOptSearch(metric="eval_accuracy", mode="max"),
             n_trials=n_trials,
             resources_per_trial={"cpu": self.nproc, "gpu": 1},
             progress_reporter=reporter,
-            log_to_file=('tune_stdout.log','tune_stderr.log'),
-            name='hp_search'
+            log_to_file=("tune_stdout.log", "tune_stderr.log"),
+            name="hp_search"
         )
 
-        #Load an re-save the best model and tokenizer in seperate directory
+        # Best model handling
         from ray.tune import ExperimentAnalysis
-        analysis = ExperimentAnalysis(os.path.join(output_directory,'hp_search'))
-        best_trial = analysis.get_best_trial(metric='eval_loss',mode='min')
-        best_ckpt = analysis.get_best_checkpoint(best_trial,metric='eval_loss',mode='min')
+        analysis = ExperimentAnalysis(os.path.join(output_directory, "hp_search"))
+        best_trial = analysis.get_best_trial(metric="eval_loss", mode="min")
+        best_ckpt = analysis.get_best_checkpoint(best_trial, metric="eval_loss", mode="min")
 
-        #load and re-save best model and tokenizer
-        from transformers import BertForSequenceClassification, AutoTokenizer
-        model_best = BertForSequenceClassification.from_pretrained(
-            best_ckpt,
-            num_labels=len(self.label_mapping),
-            local_files_only=local_files_only
-        )
-        tokenizer_best = AutoTokenizer.from_pretrained(
-            model_checkpoint,
-            local_files_only=local_files_only
-        )
-        best_model_dir = os.path.join(output_directory,'best_model')
-        os.makedirs(best_model_dir,exist_ok=True)
+        from transformers import AutoTokenizer
+        best_model_dir = os.path.join(output_directory, "best_model")
+        os.makedirs(best_model_dir, exist_ok=True)
+
+        model_best = ModelClass.from_pretrained(best_ckpt, config=config, local_files_only=local_files_only)
+        tokenizer_best = AutoTokenizer.from_pretrained(model_checkpoint, local_files_only=local_files_only)
         model_best.save_pretrained(best_model_dir)
         tokenizer_best.save_pretrained(best_model_dir)
 
         ray.shutdown()
         return best
+
 
 
     def evaluate(
@@ -525,7 +531,8 @@ class GenericClassifier:
         args = TrainingArguments(
             output_dir=output_directory,
             per_device_eval_batch_size=self.forward_batch_size,
-            eval_strategy='no'
+            eval_strategy='no',
+            disable_tqdm=True
         )
         trainer = Trainer(
             model=model,

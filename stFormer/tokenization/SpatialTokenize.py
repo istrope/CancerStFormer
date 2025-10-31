@@ -324,6 +324,7 @@ class SpatialTokenizer:
                 meta_all[ok].extend(m.get(ik, []))
 
         for p in tqdm(paths, desc='Tokenizing Anndata', total=len(paths)):
+            self.file = p
             c, m = self._process_file(p)
             _handle_result(c, m)
 
@@ -338,8 +339,9 @@ class SpatialTokenizer:
         if 'n_counts' not in ad.obs:
             ad.obs['n_counts'] = ad.X.sum(axis=1).A1 if sp.issparse(ad.X) else ad.X.sum(axis=1)
         # Filter zero-count cells
+        ad.obs['n_counts'] = ad.obs['n_counts'].astype(int)
         ad = ad[ad.obs['n_counts'] > 0]
-
+        ad.var_names_make_unique()
         # Optional downsampling
         if self.down_pct:
             idxs = np.arange(ad.n_obs)
@@ -363,7 +365,7 @@ class SpatialTokenizer:
         # Detect raw vs normalized: integer row sums == raw counts
         row_sums = X.sum(axis=1)
         is_raw = np.allclose(row_sums, np.round(row_sums))
-        logger.info(f"[Auto-detect] Input appears to be {'raw counts' if is_raw else 'normalized values'}.")
+        #logger.info(f"[Auto-detect] Input appears to be {'raw counts' if is_raw else 'normalized values'}.")
 
         n_cells = X.shape[0]
         c_out = []
@@ -395,8 +397,15 @@ class SpatialTokenizer:
                 nei_tok = rank_genes_vectorized(nei_norm, tokens, self.gene_length)
                 combined = np.concatenate([spot_tok, nei_tok], axis=1)
                 c_out.extend(combined.tolist())
-
-        meta = {ik: ad.obs[ik].astype(str).tolist() for ik in self.meta_map}
+        
+        meta = {}
+        for ik in self.meta_map.keys():
+            if ik not in ad.obs.columns: #handles metadata that doesn't exist
+                meta[ik] = [np.nan] *ad.shape[0]
+                logging.info(f'metadata value: {ik} not present for file {self.file}')
+            else:
+                meta[ik] = ad.obs[ik].astype(str).tolist()
+        #meta = {ik: ad.obs[ik].astype(str).tolist() for ik in self.meta_map}
         return c_out, meta
 
     def _make_ds(self, cells: List[np.ndarray], meta: Dict[str, List]) -> Dataset:

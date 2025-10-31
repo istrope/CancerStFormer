@@ -15,11 +15,14 @@ from datasets import load_from_disk
 
 logger = logging.getLogger(__name__)
 
-def load_and_filter(filter_data, nproc, input_data_file):
+def load_and_filter(filter_data, nproc, input_data):
     """
     Load a dataset and apply filtering criteria.
     """
-    data = load_from_disk(input_data_file)
+    if isinstance(input_data,str):
+        data = load_from_disk(input_data)
+    else: #already HF dataset
+        data = input_data
     if filter_data:
         for key, values in filter_data.items():
             data = data.filter(lambda ex: ex[key] in values, num_proc=nproc)
@@ -147,25 +150,94 @@ def label_classes(classifier, data, class_dict, token_dict_path, nproc):
     else:
         raise ValueError(f"Unknown classifier type: {classifier}")
 
+def predict_from_checkpoint(
+    model_dir: str,
+    dataset_path: str,
+    classifier_type: str = "sequence",
+    batch_size: int = 32,
+    num_workers: int = 4,
+    return_logits: bool = False
+):
+    """
+    Load a trained model from `model_dir` and run predictions on a dataset saved at `dataset_path`.
+
+    Args:
+        model_dir (str): Path to the saved model directory.
+        dataset_path (str): Path to the Hugging Face dataset directory.
+        classifier_type (str): 'sequence' or 'token'.
+        batch_size (int): Batch size for prediction.
+        num_workers (int): Number of workers for dataloader.
+        return_logits (bool): If True, return raw logits as well.
+
+    Returns:
+        Tuple[List[int], Optional[np.ndarray]]: Predicted class indices, optionally logits.
+    """
+    from transformers import (
+    AutoTokenizer,
+    AutoModelForSequenceClassification,
+    AutoModelForTokenClassification,
+    Trainer,
+    TrainingArguments
+    )
+    from datasets import load_from_disk
+    import os
+   
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(model_dir)
+    except:
+        raise ValueError(f'Tokenizer not found in model dir: {model_dir}, try specifying tokenizer path')
+
+    dataset = load_from_disk(dataset_path)
+
+    if classifier_type == 'sequence':
+        model = AutoModelForSequenceClassification.from_pretrained(model_dir)
+        collator = DataCollatorForCellClassification(tokenizer, padding='max_length', max_length=tokenizer.model_max_length)
+        columns = ['input_ids', 'label']
+    else:
+        model = AutoModelForTokenClassification.from_pretrained(model_dir)
+        collator = DataCollatorForGeneClassification(tokenizer, padding='max_length', max_length=tokenizer.model_max_length)
+        columns = ['input_ids', 'labels']
+
+    dataset.set_format(type='torch', columns=columns)
+
+    dummy_args = TrainingArguments(
+        output_dir=os.path.join(model_dir, 'tmp_pred'),
+        per_device_eval_batch_size=batch_size,
+        dataloader_num_workers=num_workers,
+        do_train=False,
+        do_eval=False,
+        logging_dir=os.path.join(model_dir, 'logs')
+    )
+
+    trainer = Trainer(
+        model=model,
+        args=dummy_args,
+        data_collator=collator
+    )
+    
+    predictions = trainer.predict(dataset)
+    predicted_classes = predictions.predictions.argmax(-1)
+
+    if return_logits:
+        return predicted_classes.tolist(), predictions.predictions
+    return predicted_classes.tolist()
 
 import torch
 from transformers import DataCollatorWithPadding
 
 class DataCollatorForCellClassification(DataCollatorWithPadding):
-    """
-    A data collator for cell classification that pads input_ids and collates labels.
-    """
-    def __call__(self, features):
-        labels = [f["label"] for f in features]
-        input_ids = [f["input_ids"] for f in features]
-        batch = {
-            "input_ids": torch.tensor(input_ids, dtype=torch.long),
-            "labels": torch.tensor(labels, dtype=torch.long)
-        }
-        return batch
+    def __init__(self, tokenizer, padding='max_length', max_length=2048):
+        super().__init__(tokenizer=tokenizer, padding=padding, max_length=max_length)
 
-import torch
-from transformers import DataCollatorWithPadding
+    def __call__(self, features):
+        labels = []
+        for i, f in enumerate(features):
+            lab = f.pop("label")
+            labels.append(lab.item())
+        batch = super().__call__(features)
+        batch["labels"] = torch.tensor(labels, dtype=torch.long)
+
+        return batch
 _tf_tokenizer_logger = logging.getLogger("transformers.tokenization_utils_base")
 
 class DataCollatorForGeneClassification:
