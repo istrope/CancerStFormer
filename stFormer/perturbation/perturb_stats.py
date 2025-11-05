@@ -1,978 +1,417 @@
-"""
-Geneformer in silico perturber stats generator.
-     from geneformer import InSilicoPerturberStats
-     ispstats = InSilicoPerturberStats(mode="goal_state_shift",
-        cell_states_to_model={"state_key": "disease",
-                              "start_state": "dcm",
-                              "goal_state": "nf",
-                              "alt_states": ["hcm", "other1", "other2"]})
-     ispstats.get_stats("path/to/input_data",
-                        None,
-                        "path/to/output_directory",
-                        "output_prefix")
-Aggregates data or calculates stats for in silico perturbations based on type of statistics specified in InSilicoPerturberStats.
-Input data is raw in silico perturbation results in the form of dictionaries outputted by ``in_silico_perturber``.
-"""
+from __future__ import annotations
 
-
-import logging
 import os
+import io
+import json
+import math
 import pickle
-import random
+import logging
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from collections import defaultdict, Counter
 
 import numpy as np
 import pandas as pd
-import statsmodels.stats.multitest as smt
-from scipy.stats import mannwhitneyu
-from sklearn.mixture import GaussianMixture
-from tqdm.auto import trange
-from tqdm import tqdm
 
-from stFormer.perturbation.perturb_utils import flatten_list, validate_cell_states_to_model
+try:
+    from sklearn.mixture import GaussianMixture
+except Exception:  # optional
+    GaussianMixture = None  # type: ignore
 
 logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
-def invert_dict(dictionary):
-    return {v: k for k, v in dictionary.items()}
 
-def read_dict(cos_sims_dict, cell_or_gene_emb, anchor_token):
-    if cell_or_gene_emb == "cell":
-        cell_emb_dict = {k: v for k, v in cos_sims_dict.items() if v and "cell_emb" in k}
-        return [cell_emb_dict]
-    elif cell_or_gene_emb == "gene":
-        if anchor_token is None:
-            gene_emb_dict = {k: v for k, v in cos_sims_dict.items() if v}
+# ----------------------------
+# Utilities
+# ----------------------------
+
+def _is_pickle_path(p: Union[str, os.PathLike]) -> bool:
+    s = str(p)
+    return s.endswith(".pkl") or s.endswith(".pickle")
+
+def _load_raw_pickle(path: Union[str, os.PathLike]) -> dict:
+    with open(path, "rb") as f:
+        return pickle.load(f)
+
+def _iter_raw_pickles(path_or_dir: Union[str, os.PathLike]) -> Iterable[dict]:
+    p = Path(path_or_dir)
+    if p.is_file():
+        yield _load_raw_pickle(p)
+    else:
+        for fp in sorted(p.glob("*_raw.pickle")):
+            yield _load_raw_pickle(fp)
+
+def _bh_fdr(pvals: Sequence[float]) -> List[float]:
+    """Benjamini-Hochberg FDR correction."""
+    p = np.asarray([v if (v is not None and np.isfinite(v)) else 1.0 for v in pvals], dtype=float)
+    n = p.size
+    order = np.argsort(p)
+    ranked = p[order]
+    q = np.empty_like(ranked)
+    prev = 1.0
+    for i in range(n-1, -1, -1):
+        rank = i + 1
+        q[i] = min(prev, ranked[i] * n / rank)
+        prev = q[i]
+    out = np.empty_like(q)
+    out[order] = q
+    return out.tolist()
+
+def _mannwhitney_u_vs_zero(x: np.ndarray) -> float:
+    """Nonparametric test: compare distribution of x against zero values using a rank strategy.
+    This approximates a two-sided test vs. a degenerate distribution at 0.
+    Returns a p-value in [0,1]."""
+    if x.size == 0:
+        return 1.0
+    # ranks of |x| with sign handling
+    ranks = np.argsort(np.argsort(np.abs(x))) + 1
+    # Effect sign: positive if median(x) > 0
+    sign = 1 if np.median(x) >= 0 else -1
+    u = float(np.sum(sign * ranks))
+    # Normal approximation
+    mu = 0.0
+    sigma = math.sqrt(np.sum(ranks**2) / 12.0 + 1e-8)
+    z = 0.0 if sigma == 0 else (u - mu) / sigma
+    # two-sided
+    from math import erf, sqrt
+    p = 2.0 * (1.0 - 0.5*(1.0 + erf(abs(z)/sqrt(2.0))))
+    return float(np.clip(p, 0.0, 1.0))
+
+def _safe_mean_std(vals: Sequence[float]) -> Tuple[float, float]:
+    if not vals:
+        return (float("nan"), float("nan"))
+    a = np.asarray(vals, dtype=float)
+    return float(np.nanmean(a)), float(np.nanstd(a))
+
+def _merge_raw_dicts(dicts: List[dict]) -> dict:
+    merged = defaultdict(list)
+    for d in dicts:
+        for k, v in d.items():
+            if v is None:
+                continue
+            if isinstance(v, (list, tuple)):
+                merged[k].extend([float(x) for x in v])
+            else:
+                merged[k].append(float(v))
+    return dict(merged)
+
+def _split_cell_gene_subdicts(raw: dict) -> Tuple[dict, dict]:
+    """Return (cell_dict, gene_dict)."""
+    cell = {k: v for k, v in raw.items() if isinstance(k, tuple) and len(k) == 2 and k[1] == "cell_emb"}
+    gene = {k: v for k, v in raw.items() if isinstance(k, tuple) and len(k) == 2 and isinstance(k[0], int) and isinstance(k[1], int)}
+    return cell, gene
+
+def _token_to_name(tok: int, tok2name: Optional[Dict[int, str]]) -> str:
+    if tok2name is None:
+        return str(tok)
+    return tok2name.get(int(tok), str(tok))
+
+
+# ----------------------------
+# Stats implementations
+# ----------------------------
+
+def _mode_aggregate_data(raw_merged: dict,
+                         tok2name: Optional[Dict[int, str]],
+                         out_csv: Union[str, os.PathLike]) -> str:
+    """Aggregate cell-level shifts for a single perturbation."""
+    cell_dict, _ = _split_cell_gene_subdicts(raw_merged)
+    rows = []
+    for key, vals in cell_dict.items():
+        pert = key[0]  # int or tuple
+        m, s = _safe_mean_std(vals)
+        rows.append({
+            "Perturbed": _token_to_name(pert, tok2name) if not isinstance(pert, tuple) else ",".join(_token_to_name(t, tok2name) for t in pert),
+            "Cosine_sim_mean": m,
+            "Cosine_sim_stdev": s,
+            "N_Detections": len(vals),
+        })
+    df = pd.DataFrame(rows).sort_values("Cosine_sim_mean", ascending=True)
+    Path(out_csv).parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(out_csv, index=False)
+    return str(out_csv)
+
+
+def _mode_aggregate_gene_shifts(raw_merged: dict,
+                                tok2name: Optional[Dict[int, str]],
+                                out_csv: Union[str, os.PathLike],
+                                tok2ens: Optional[Dict[int, str]] = None) -> str:
+    """
+    Columns:
+    Perturbed, Gene_name, Ensembl_ID, Affected, Affected_gene_name, Affected_Ensembl_ID,
+    Cosine_sim_mean, Cosine_sim_stdev, N_Detections
+    """
+    _, gene_dict = _split_cell_gene_subdicts(raw_merged)
+    rows = []
+    for (pert_tok, aff_tok), vals in gene_dict.items():
+        mean_v, std_v = _safe_mean_std(vals)
+        pert_name = _token_to_name(pert_tok, tok2name)
+        aff_name  = _token_to_name(aff_tok, tok2name)
+        pert_ens = tok2ens.get(int(pert_tok), str(pert_tok)) if tok2ens else str(pert_tok)
+        aff_ens  = tok2ens.get(int(aff_tok), str(aff_tok)) if tok2ens else str(aff_tok)
+        rows.append({
+            "Perturbed": pert_name,  # display name of perturbed gene
+            "Gene_name": pert_name,
+            "Ensembl_ID": pert_ens,
+            "Affected": aff_name,    # display name of affected gene
+            "Affected_gene_name": aff_name,
+            "Affected_Ensembl_ID": aff_ens,
+            "Cosine_sim_mean": mean_v,
+            "Cosine_sim_stdev": std_v,
+            "N_Detections": len(vals),
+        })
+    # Enforce exact column order
+    cols = [
+        "Perturbed","Gene_name","Ensembl_ID",
+        "Affected","Affected_gene_name","Affected_Ensembl_ID",
+        "Cosine_sim_mean","Cosine_sim_stdev","N_Detections",
+    ]
+    df = pd.DataFrame(rows, columns=cols).sort_values(["Cosine_sim_mean"],ascending=True)
+    Path(out_csv).parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(out_csv, index=False)
+    return str(out_csv)
+
+
+def _mode_vs_null(raw_merged: dict,
+                  null_merged: dict,
+                  tok2name: Optional[Dict[int, str]],
+                  out_csv: Union[str, os.PathLike]) -> str:
+    """Compare cell shifts vs a NULL distribution (separate raw dict set)."""
+    cell_t, _ = _split_cell_gene_subdicts(raw_merged)
+    cell_n, _ = _split_cell_gene_subdicts(null_merged)
+    # assume single cell key per run (typical)
+    rows = []
+    for k, vals_t in cell_t.items():
+        vals_n = []
+        # If null has matching key, use it; else flatten all
+        if k in cell_n:
+            vals_n = cell_n[k]
         else:
-            gene_emb_dict = {k: v for k, v in cos_sims_dict.items() if v and anchor_token == k[0]}
-    return [gene_emb_dict]
+            for _, v in cell_n.items():
+                vals_n.extend(v)
+        # effect size & test
+        mt, st = _safe_mean_std(vals_t)
+        mn, sn = _safe_mean_std(vals_n)
+        # Two-sample MWU approximate p-value by shift vs zero after centering on null mean
+        x = np.asarray(vals_t, dtype=float) - (mn if np.isfinite(mn) else 0.0)
+        pval = _mannwhitney_u_vs_zero(x)
+        rows.append({
+            "Perturbed": _token_to_name(k[0], tok2name) if not isinstance(k[0], tuple) else ",".join(_token_to_name(t, tok2name) for t in k[0]),
+            "Test_mean": mt, "Test_stdev": st, "Test_n": len(vals_t),
+            "Null_mean": mn, "Null_stdev": sn, "Null_n": len(vals_n),
+            "p_value": pval,
+        })
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df["q_value"] = _bh_fdr(df["p_value"].tolist())
+    Path(out_csv).parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(out_csv, index=False)
+    return str(out_csv)
 
 
-# read raw dictionary files
-def read_dictionaries(
-    input_data_directory,
-    cell_or_gene_emb,
-    anchor_token,
-    cell_states_to_model,
-    pickle_suffix,
-):
-    file_found = False
-    file_path_list = []
-    if cell_states_to_model is None:
-        dict_list = []
-    else:
-        validate_cell_states_to_model(cell_states_to_model)
-        cell_states_to_model_valid = {
-            state: value
-            for state, value in cell_states_to_model.items()
-            if state != "state_key"
-            and cell_states_to_model[state] is not None
-            and cell_states_to_model[state] != []
-        }
-        cell_states_list = []
-        # flatten all state values into list
-        for state in cell_states_to_model_valid:
-            value = cell_states_to_model_valid[state]
-            if isinstance(value, list):
-                cell_states_list += value
+def _mode_goal_state_shift(raw_by_state: Dict[str, dict],
+                           state_cfg: dict,
+                           tok2name: Optional[Dict[int, str]],
+                           out_csv: Union[str, os.PathLike]) -> str:
+    """State-aware goal shift: compare start vs goal (and optional alt states)."""
+    # Expect keys: 'start_state','goal_state', optional 'alt_states' (list)
+    start_key = state_cfg.get("start_state")
+    goal_key  = state_cfg.get("goal_state")
+    alt_list  = state_cfg.get("alt_states", []) or []
+    if start_key is None or goal_key is None:
+        raise ValueError("goal_state_shift requires 'start_state' and 'goal_state' in cell_states_to_model")
+
+    # Merge cell dicts per state
+    def merge_state_cell(d):
+        cell, _ = _split_cell_gene_subdicts(d)
+        all_vals = []
+        for _, v in cell.items():
+            all_vals.extend(v)
+        return np.asarray(all_vals, dtype=float)
+
+    x_start = merge_state_cell(raw_by_state[start_key]) if start_key in raw_by_state else np.asarray([], dtype=float)
+    x_goal  = merge_state_cell(raw_by_state[goal_key]) if goal_key in raw_by_state else np.asarray([], dtype=float)
+    p_start_vs_goal = _mannwhitney_u_vs_zero(x_start - (np.nanmean(x_goal) if x_goal.size else 0.0))
+
+    rows = [{
+        "Start_state": start_key,
+        "Goal_state": goal_key,
+        "Start_mean": float(np.nanmean(x_start)) if x_start.size else float("nan"),
+        "Goal_mean": float(np.nanmean(x_goal)) if x_goal.size else float("nan"),
+        "Start_n": int(x_start.size), "Goal_n": int(x_goal.size),
+        "p_value": p_start_vs_goal,
+    }]
+
+    # Optional alt comparisons
+    for alt in alt_list:
+        if alt not in raw_by_state:
+            continue
+        x_alt = merge_state_cell(raw_by_state[alt])
+        p_goal_vs_alt = _mannwhitney_u_vs_zero(x_goal - (np.nanmean(x_alt) if x_alt.size else 0.0))
+        rows.append({
+            "Alt_state": alt,
+            "Alt_mean": float(np.nanmean(x_alt)) if x_alt.size else float("nan"),
+            "Alt_n": int(x_alt.size),
+            "Alt_p_value": p_goal_vs_alt,
+        })
+
+    df = pd.DataFrame(rows)
+    # FDR over available p-values columns
+    pcols = [c for c in df.columns if c.endswith("_value")]
+    if pcols:
+        allp = []
+        for c in pcols:
+            allp.extend(df[c].fillna(1.0).tolist())
+        q = _bh_fdr(allp)
+        # split back
+        i = 0
+        for c in pcols:
+            n = df[c].shape[0]
+            df[c.replace("_value", "_qvalue")] = q[i:i+n]
+            i += n
+
+    Path(out_csv).parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(out_csv, index=False)
+    return str(out_csv)
+
+
+def _mode_mixture_model(raw_merged: dict,
+                        tok2name: Optional[Dict[int, str]],
+                        out_csv: Union[str, os.PathLike]) -> str:
+    """Two-component GMM on per-gene means, label 'impact' component and % impact."""
+    if GaussianMixture is None:
+        raise ImportError("scikit-learn is required for mixture_model mode but is not available.")
+
+    _, gene_dict = _split_cell_gene_subdicts(raw_merged)
+    # compute per-gene means (collapse across cells)
+    per_gene = [(k[1], float(np.nanmean(v))) for k, v in gene_dict.items()]  # (affected_token, mean)
+    if not per_gene:
+        df = pd.DataFrame(columns=["Affected", "Mean", "Impact_component", "Impact_component_percent"])
+        Path(out_csv).parent.mkdir(parents=True, exist_ok=True)
+        df.to_csv(out_csv, index=False)
+        return str(out_csv)
+
+    tokens, means = zip(*per_gene)
+    X = np.array(means, dtype=float).reshape(-1, 1)
+
+    gmm = GaussianMixture(n_components=2, covariance_type="full", random_state=0)
+    gmm.fit(X)
+    labels = gmm.predict(X)
+    # define "impact" as component with lower mean (stronger negative shift) or higher |mean|
+    comp_means = gmm.means_.flatten()
+    impact_label = int(np.argmin(comp_means))  # lower mean = more negative shift
+    impact_mask = (labels == impact_label)
+    impact_pct = float(np.mean(impact_mask) * 100.0)
+
+    rows = []
+    for tok, m, lab in zip(tokens, means, labels):
+        rows.append({
+            "Affected": _token_to_name(tok, tok2name),
+            "Mean": float(m),
+            "Impact_component": int(lab),
+        })
+    df = pd.DataFrame(rows)
+    df["Impact_component_percent"] = impact_pct
+    Path(out_csv).parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(out_csv, index=False)
+    return str(out_csv)
+
+@dataclass
+class PerturberStats:
+    mode: str
+    top_k: Optional[int] = None
+    nperms: Optional[int] = None
+    fdr_alpha: float = 0.05
+    min_cells: int = 1
+    # dictionaries for mapping
+    gene_token_id_dict: Optional[Dict[str, int]] = None  # ENSEMBL->token
+    gene_id_name_dict: Optional[Dict[str, str]] = None   # ENSEMBL->symbol
+    cell_states_to_model: Optional[dict] = None          # {"state_key":..., "start_state":..., "goal_state":..., "alt_states":[...]}
+
+    def _tok_maps(self):
+        """Return (tok2name, tok2ens) if dicts provided; else (None, None)."""
+        if not self.gene_token_id_dict or not self.gene_id_name_dict:
+            return None, None
+        tok2name = {}
+        tok2ens = {}
+        for ens, tok in self.gene_token_id_dict.items():
+            try:
+                itok = int(tok)
+            except Exception:
+                continue
+            tok2ens[itok] = str(ens)
+            tok2name[itok] = str(self.gene_id_name_dict.get(ens, str(ens)))
+        return tok2name, tok2ens
+
+    def _load_and_merge(self, path_or_dir: Union[str, os.PathLike]) -> dict:
+        dicts = list(_iter_raw_pickles(path_or_dir))
+        if not dicts:
+            return {}
+        return _merge_raw_dicts(dicts)
+
+    def _load_by_state(self, base_dir: Union[str, os.PathLike]) -> Dict[str, dict]:
+        """Load per-state raw dicts from subdirectories located under base_dir."""
+        assert self.cell_states_to_model, "cell_states_to_model must be provided for goal_state_shift"
+        state_key = self.cell_states_to_model.get("state_key", "state")
+        states = []
+        for k, v in self.cell_states_to_model.items():
+            if k == "state_key" or v is None:
+                continue
+            if isinstance(v, list):
+                states.extend(v)
             else:
-                cell_states_list.append(value)
-        state_dict = {state_value: dict() for state_value in cell_states_list}
-    for file in os.listdir(input_data_directory):
-        # process only files with given suffix (e.g. "_raw.pickle")
-        if file.endswith(pickle_suffix):
-            file_found = True
-            file_path_list += [f"{input_data_directory}/{file}"]
-    for file_path in tqdm(file_path_list):
-        with open(file_path, "rb") as fp:
-            cos_sims_dict = pickle.load(fp)
-            if cell_states_to_model is None:
-                dict_list += read_dict(cos_sims_dict, cell_or_gene_emb, anchor_token)
-            else:
-                for state_value in cell_states_list:
-                    new_dict = read_dict(
-                        cos_sims_dict[state_value], cell_or_gene_emb, anchor_token
-                    )[0]
-                    for key in new_dict:
-                        try:
-                            state_dict[state_value][key] += new_dict[key]
-                        except KeyError:
-                            state_dict[state_value][key] = new_dict[key]
-    if not file_found:
-        logger.error(
-            "No raw data for processing found within provided directory. "
-            "Please ensure data files end with '{pickle_suffix}'."
-        )
-        raise
-    if cell_states_to_model is None:
-        return dict_list
-    else:
-        return state_dict
-
-
-# get complete gene list
-def get_gene_list(dict_list, mode):
-    if mode == "cell":
-        position = 0
-    elif mode == "gene":
-        position = 1
-    gene_set = set()
-    if isinstance(dict_list, list):
-        for dict_i in dict_list:
-            gene_set.update([k[position] for k, v in dict_i.items() if v])
-    elif isinstance(dict_list, dict):
-        for state, dict_i in dict_list.items():
-            gene_set.update([k[position] for k, v in dict_i.items() if v])
-    else:
-        logger.error(
-            "dict_list should be a list, or if modeling shift to goal states, a dict. "
-            f"{type(dict_list)} is not the correct format."
-        )
-        raise
-    gene_list = list(gene_set)
-    if mode == "gene":
-        gene_list.remove("cell_emb")
-    gene_list.sort()
-    return gene_list
-
-
-def token_tuple_to_ensembl_ids(token_tuple, gene_token_id_dict):
-    try:
-        return tuple([gene_token_id_dict.get(i, np.nan) for i in token_tuple])
-    except TypeError:
-        return gene_token_id_dict.get(token_tuple, np.nan)
-
-
-def n_detections(token, dict_list, mode, anchor_token):
-    cos_sim_megalist = []
-    for dict_i in dict_list:
-        if mode == "cell":
-            cos_sim_megalist += dict_i.get((token, "cell_emb"), [])
-        elif mode == "gene":
-            cos_sim_megalist += dict_i.get((anchor_token, token), [])
-    return len(cos_sim_megalist)
-
-
-def get_fdr(pvalues):
-    return list(smt.multipletests(pvalues, alpha=0.05, method="fdr_bh")[1])
-
-
-def get_impact_component(test_value, gaussian_mixture_model):
-    impact_border = gaussian_mixture_model.means_[0][0]
-    nonimpact_border = gaussian_mixture_model.means_[1][0]
-    if test_value > nonimpact_border:
-        impact_component = 0
-    elif test_value < impact_border:
-        impact_component = 1
-    else:
-        impact_component_raw = gaussian_mixture_model.predict([[test_value]])[0]
-        if impact_component_raw == 1:
-            impact_component = 0
-        elif impact_component_raw == 0:
-            impact_component = 1
-    return impact_component
-
-
-# aggregate data for single perturbation in multiple cells
-def isp_aggregate_grouped_perturb(cos_sims_df, dict_list, genes_perturbed):
-    names = ["Cosine_sim", "Gene"]
-    cos_sims_full_dfs = []
-    if isinstance(genes_perturbed,list):
-        if len(genes_perturbed)>1:
-            gene_ids_df = cos_sims_df.loc[np.isin([set(idx) for idx in cos_sims_df["Ensembl_ID"]], set(genes_perturbed)), :]
-        else:
-            gene_ids_df = cos_sims_df.loc[np.isin(cos_sims_df["Ensembl_ID"], genes_perturbed), :]
-    else:
-        logger.error(
-                        "aggregate_data is for perturbation of single gene or single group of genes. genes_to_perturb should be formatted as list."
-                    )
-        raise        
-
-    if gene_ids_df.empty:
-        logger.error(
-                        "genes_to_perturb not found in data."
-                    )
-        raise
-        
-    tokens = gene_ids_df["Gene"]
-    symbols = gene_ids_df["Gene_name"]
-
-    for token, symbol in zip(tokens, symbols):
-        cos_shift_data = []
-        for dict_i in dict_list:
-            cos_shift_data += dict_i.get((token, "cell_emb"), [])
-
-        df = pd.DataFrame(columns=names)
-        df["Cosine_sim"] = cos_shift_data
-        df["Gene"] = symbol
-        cos_sims_full_dfs.append(df)
-    
-    return pd.concat(cos_sims_full_dfs)
-
-
-def find(variable, x):
-    try:
-        if x in variable:  # Test if variable is iterable and contains x
-            return True
-        elif x == variable:
-            return True
-    except (ValueError, TypeError):
-        return x == variable  # Test if variable is x if non-iterable
-
-
-def isp_aggregate_gene_shifts(
-    cos_sims_df, dict_list, gene_token_id_dict, gene_id_name_dict
-):
-    cos_shift_data = dict()
-    for i in trange(cos_sims_df.shape[0]):
-        token = cos_sims_df["Gene"][i]
-        for dict_i in dict_list:
-            affected_pairs = [k for k, v in dict_i.items() if find(k[0], token)]
-            for key in affected_pairs:
-                if key in cos_shift_data.keys():
-                    cos_shift_data[key] += dict_i.get(key, [])
-                else:
-                    cos_shift_data[key] = dict_i.get(key, [])
-
-    cos_data_mean = {
-        k: [np.mean(v), np.std(v), len(v)] for k, v in cos_shift_data.items()
-    }
-    cos_sims_full_df = pd.DataFrame()
-    cos_sims_full_df["Perturbed"] = [k[0] for k, v in cos_data_mean.items()]
-    cos_sims_full_df["Gene_name"] = [
-        cos_sims_df[cos_sims_df["Gene"] == k[0]]["Gene_name"][0]
-        for k, v in cos_data_mean.items()
-    ]
-    cos_sims_full_df["Ensembl_ID"] = [
-        cos_sims_df[cos_sims_df["Gene"] == k[0]]["Ensembl_ID"][0]
-        for k, v in cos_data_mean.items()
-    ]
-
-    cos_sims_full_df["Affected"] = [k[1] for k, v in cos_data_mean.items()]
-    cos_sims_full_df["Affected_gene_name"] = [
-        gene_id_name_dict.get(gene_token_id_dict.get(token, np.nan), np.nan)
-        for token in cos_sims_full_df["Affected"]
-    ]
-    cos_sims_full_df["Affected_Ensembl_ID"] = [
-        gene_token_id_dict.get(token, np.nan) for token in cos_sims_full_df["Affected"]
-    ]
-    cos_sims_full_df["Cosine_sim_mean"] = [v[0] for k, v in cos_data_mean.items()]
-    cos_sims_full_df["Cosine_sim_stdev"] = [v[1] for k, v in cos_data_mean.items()]
-    cos_sims_full_df["N_Detections"] = [v[2] for k, v in cos_data_mean.items()]
-
-    specific_val = "cell_emb"
-    cos_sims_full_df["temp"] = list(cos_sims_full_df["Affected"] == specific_val)
-    # reorder so cell embs are at the top and all are subordered by magnitude of cosine sim
-    cos_sims_full_df = cos_sims_full_df.sort_values(
-        by=(["temp", "Cosine_sim_mean"]), ascending=[False, True]
-    ).drop("temp", axis=1)
-
-    return cos_sims_full_df
-
-
-# stats comparing cos sim shifts towards goal state of test perturbations vs random perturbations
-def isp_stats_to_goal_state(
-    cos_sims_df, result_dict, cell_states_to_model, genes_perturbed
-):
-
-    from collections import defaultdict
-    alt_states = cell_states_to_model.get("alt_states", [])
-    alt_states = [s for s in alt_states if s is not None]
-    alt_end_state_exists = len(alt_states) > 0
-
-    if genes_perturbed != "all":
-        token = cos_sims_df.loc[0, "Gene"]
-        goal_vals = result_dict[cell_states_to_model["goal_state"]].get((token, "cell_emb"), [])
-        res = {
-            "Shift_to_goal_end": [np.mean(goal_vals) if goal_vals else np.nan]
-        }
-        if alt_end_state_exists:
-            for alt in alt_states:
-                vals = result_dict[alt].get((token, "cell_emb"), [])
-                res[f"Shift_to_alt_end_{alt}"] = [np.mean(vals) if vals else np.nan]
-        return pd.DataFrame(res)
-
-    #### genes_perturbed == "all"
-
-    #  PRELOAD RANDOM BACKGROUND LISTS
-    goal_random = []
-    alt_random = defaultdict(list)
-
-    for i, token in enumerate(cos_sims_df["Gene"]):
-        goal_random.extend(result_dict[cell_states_to_model["goal_state"]].get((token, "cell_emb"), []))
-        if alt_end_state_exists:
-            for alt in alt_states:
-                alt_random[alt].extend(result_dict[alt].get((token, "cell_emb"), []))
-
-    cos_sims_df["N_Detections"] = [
-        len(result_dict[cell_states_to_model["goal_state"]].get((token, "cell_emb"), []))
-        for token in cos_sims_df["Gene"] 
-        ]
-    # Keep only genes with enough observations for reliable p-values
-    cos_sims_df = cos_sims_df[cos_sims_df["N_Detections"] >= 5].reset_index(drop=True)
-    # Downsample for speed
-    random.seed(42)
-    if len(goal_random) > 100_000:
-        goal_random = random.sample(goal_random, 100_000)
-    for alt in alt_states:
-        if len(alt_random[alt]) > 100_000:
-            alt_random[alt] = random.sample(alt_random[alt], 100_000)
-
-    # MAIN LOOP: COLLECT RESULTS INTO LIST
-    results = []
-    for i, row in tqdm(cos_sims_df.iterrows(),total=len(cos_sims_df),desc='Collecting Cosine Sims'):
-        token = row["Gene"]
-        name = row["Gene_name"]
-        ensembl = row["Ensembl_ID"]
-
-        vals_goal = result_dict[cell_states_to_model["goal_state"]].get((token, "cell_emb"), [])
-        mean_goal = np.mean(vals_goal) if vals_goal else np.nan
-        pval_goal = mannwhitneyu(goal_random, vals_goal).pvalue if vals_goal else 1.0
-
-        res = {
-            "Gene": token,
-            "Gene_name": name,
-            "Ensembl_ID": ensembl,
-            "Shift_to_goal_end": mean_goal,
-            "Goal_end_vs_random_pval": pval_goal,
-            "N_Detections": len(vals_goal),
-        }
-
-        if alt_end_state_exists:
-            for alt in alt_states:
-                vals_alt = result_dict[alt].get((token, "cell_emb"), [])
-                mean_alt = np.mean(vals_alt) if vals_alt else np.nan
-                pval_alt = mannwhitneyu(alt_random[alt], vals_alt).pvalue if vals_alt else 1.0
-                res[f"Shift_to_alt_end_{alt}"] = mean_alt
-                res[f"Alt_end_vs_random_pval_{alt}"] = pval_alt
-
-        results.append(res)
-
-    cos_sims_full_df = pd.DataFrame(results)
-
-    #  FDR CALCULATION (VECTORIZE) -
-    cos_sims_full_df["Goal_end_FDR"] = get_fdr(cos_sims_full_df["Goal_end_vs_random_pval"])
-    if alt_end_state_exists:
-        for alt in alt_states:
-            cos_sims_full_df[f"Alt_end_FDR_{alt}"] = get_fdr(
-                cos_sims_full_df[f"Alt_end_vs_random_pval_{alt}"]
-            )
-
-    #  ADD SIG COLUMN & SORT
-    cos_sims_full_df["Sig"] = (cos_sims_full_df["Goal_end_FDR"] < 0.05).astype(int)
-    cos_sims_full_df = cos_sims_full_df.sort_values(
-        by=["Sig", "Shift_to_goal_end", "Goal_end_FDR"],
-        ascending=[False, False, True]
-    )
-
-    return cos_sims_full_df
-
-
-
-# stats comparing cos sim shifts of test perturbations vs null distribution
-def isp_stats_vs_null(cos_sims_df, dict_list, null_dict_list):
-    cos_sims_full_df = cos_sims_df.copy()
-
-    cos_sims_full_df["Test_avg_shift"] = np.zeros(cos_sims_df.shape[0], dtype=float)
-    cos_sims_full_df["Null_avg_shift"] = np.zeros(cos_sims_df.shape[0], dtype=float)
-    cos_sims_full_df["Test_vs_null_avg_shift"] = np.zeros(
-        cos_sims_df.shape[0], dtype=float
-    )
-    cos_sims_full_df["Test_vs_null_pval"] = np.zeros(cos_sims_df.shape[0], dtype=float)
-    cos_sims_full_df["Test_vs_null_FDR"] = np.zeros(cos_sims_df.shape[0], dtype=float)
-    cos_sims_full_df["N_Detections_test"] = np.zeros(
-        cos_sims_df.shape[0], dtype="uint32"
-    )
-    cos_sims_full_df["N_Detections_null"] = np.zeros(
-        cos_sims_df.shape[0], dtype="uint32"
-    )
-
-    for i in trange(cos_sims_df.shape[0]):
-        token = cos_sims_df["Gene"][i]
-        test_shifts = []
-        null_shifts = []
-
-        for dict_i in dict_list:
-            test_shifts += dict_i.get((token, "cell_emb"), [])
-
-        for dict_i in null_dict_list:
-            null_shifts += dict_i.get((token, "cell_emb"), [])
-
-        cos_sims_full_df.loc[i, "Test_avg_shift"] = np.mean(test_shifts)
-        cos_sims_full_df.loc[i, "Null_avg_shift"] = np.mean(null_shifts)
-        cos_sims_full_df.loc[i, "Test_vs_null_avg_shift"] = np.mean(
-            test_shifts
-        ) - np.mean(null_shifts)
-        cos_sims_full_df.loc[i, "Test_vs_null_pval"] = mannwhitneyu(
-            test_shifts, null_shifts, nan_policy="omit"
-        ).pvalue
-        # remove nan values
-        cos_sims_full_df.Test_vs_null_pval = np.where(
-            np.isnan(cos_sims_full_df.Test_vs_null_pval),
-            1,
-            cos_sims_full_df.Test_vs_null_pval,
-        )
-        cos_sims_full_df.loc[i, "N_Detections_test"] = len(test_shifts)
-        cos_sims_full_df.loc[i, "N_Detections_null"] = len(null_shifts)
-
-    cos_sims_full_df["Test_vs_null_FDR"] = get_fdr(
-        cos_sims_full_df["Test_vs_null_pval"]
-    )
-
-    cos_sims_full_df["Sig"] = [
-        1 if fdr < 0.05 else 0 for fdr in cos_sims_full_df["Test_vs_null_FDR"]
-    ]
-    cos_sims_full_df = cos_sims_full_df.sort_values(
-        by=["Sig", "Test_vs_null_avg_shift", "Test_vs_null_FDR"],
-        ascending=[False, False, True],
-    )
-    return cos_sims_full_df
-
-
-# stats for identifying perturbations with largest effect within a given set of cells
-# fits a mixture model to 2 components (impact vs. non-impact) and
-# reports the most likely component for each test perturbation
-# Note: because assumes given perturbation has a consistent effect in the cells tested,
-# we recommend only using the mixture model strategy with uniform cell populations
-def isp_stats_mixture_model(cos_sims_df, dict_list, combos, anchor_token):
-    names = ["Gene", "Gene_name", "Ensembl_ID"]
-
-    if combos == 0:
-        names += ["Test_avg_shift"]
-    elif combos == 1:
-        names += [
-            "Anchor_shift",
-            "Test_token_shift",
-            "Sum_of_indiv_shifts",
-            "Combo_shift",
-            "Combo_minus_sum_shift",
-        ]
-
-    names += ["Impact_component", "Impact_component_percent"]
-
-    cos_sims_full_df = pd.DataFrame(columns=names)
-    avg_values = []
-    gene_names = []
-
-    for i in trange(cos_sims_df.shape[0]):
-        token = cos_sims_df["Gene"][i]
-        name = cos_sims_df["Gene_name"][i]
-        ensembl_id = cos_sims_df["Ensembl_ID"][i]
-        cos_shift_data = []
-
-        for dict_i in dict_list:
-            if (combos == 0) and (anchor_token is not None):
-                cos_shift_data += dict_i.get((anchor_token, token), [])
-            else:
-                cos_shift_data += dict_i.get((token, "cell_emb"), [])
-
-        # Extract values for current gene
-        if combos == 0:
-            test_values = cos_shift_data
-        elif combos == 1:
-            test_values = []
-            for tup in cos_shift_data:
-                test_values.append(tup[2])
-
-        if len(test_values) > 0:
-            avg_value = np.mean(test_values)
-            avg_values.append(avg_value)
-            gene_names.append(name)
-
-    # fit Gaussian mixture model to dataset of mean for each gene
-    avg_values_to_fit = np.array(avg_values).reshape(-1, 1)
-    gm = GaussianMixture(n_components=2, random_state=0).fit(avg_values_to_fit)
-
-    for i in trange(cos_sims_df.shape[0]):
-        token = cos_sims_df["Gene"][i]
-        name = cos_sims_df["Gene_name"][i]
-        ensembl_id = cos_sims_df["Ensembl_ID"][i]
-        cos_shift_data = []
-
-        for dict_i in dict_list:
-            if (combos == 0) and (anchor_token is not None):
-                cos_shift_data += dict_i.get((anchor_token, token), [])
-            else:
-                cos_shift_data += dict_i.get((token, "cell_emb"), [])
-
-        if combos == 0:
-            mean_test = np.mean(cos_shift_data)
-            impact_components = [
-                get_impact_component(value, gm) for value in cos_shift_data
-            ]
-        elif combos == 1:
-            anchor_cos_sim_megalist = [
-                anchor for anchor, token, combo in cos_shift_data
-            ]
-            token_cos_sim_megalist = [token for anchor, token, combo in cos_shift_data]
-            anchor_plus_token_cos_sim_megalist = [
-                1 - ((1 - anchor) + (1 - token))
-                for anchor, token, combo in cos_shift_data
-            ]
-            combo_anchor_token_cos_sim_megalist = [
-                combo for anchor, token, combo in cos_shift_data
-            ]
-            combo_minus_sum_cos_sim_megalist = [
-                combo - (1 - ((1 - anchor) + (1 - token)))
-                for anchor, token, combo in cos_shift_data
-            ]
-
-            mean_anchor = np.mean(anchor_cos_sim_megalist)
-            mean_token = np.mean(token_cos_sim_megalist)
-            mean_sum = np.mean(anchor_plus_token_cos_sim_megalist)
-            mean_test = np.mean(combo_anchor_token_cos_sim_megalist)
-            mean_combo_minus_sum = np.mean(combo_minus_sum_cos_sim_megalist)
-
-            impact_components = [
-                get_impact_component(value, gm)
-                for value in combo_anchor_token_cos_sim_megalist
-            ]
-
-        impact_component = get_impact_component(mean_test, gm)
-        impact_component_percent = np.mean(impact_components) * 100
-
-        data_i = [token, name, ensembl_id]
-        if combos == 0:
-            data_i += [mean_test]
-        elif combos == 1:
-            data_i += [
-                mean_anchor,
-                mean_token,
-                mean_sum,
-                mean_test,
-                mean_combo_minus_sum,
-            ]
-        data_i += [impact_component, impact_component_percent]
-
-        cos_sims_df_i = pd.DataFrame(dict(zip(names, data_i)), index=[i])
-        cos_sims_full_df = pd.concat([cos_sims_full_df, cos_sims_df_i])
-
-    # quantify number of detections of each gene
-    cos_sims_full_df["N_Detections"] = [
-        n_detections(i, dict_list, "gene", anchor_token)
-        for i in cos_sims_full_df["Gene"]
-    ]
-
-    if combos == 0:
-        cos_sims_full_df = cos_sims_full_df.sort_values(
-            by=["Impact_component", "Test_avg_shift"], ascending=[False, True]
-        )
-    elif combos == 1:
-        cos_sims_full_df = cos_sims_full_df.sort_values(
-            by=["Impact_component", "Combo_minus_sum_shift"], ascending=[False, True]
-        )
-    return cos_sims_full_df
-
-
-class InSilicoPerturberStats:
-    valid_option_dict = {
-        "mode": {
-            "goal_state_shift",
-            "vs_null",
-            "mixture_model",
-            "aggregate_data",
-            "aggregate_gene_shifts",
-        },
-        "genes_perturbed": {"all", list},
-        "combos": {0, 1},
-        "anchor_gene": {None, str},
-        "cell_states_to_model": {None, dict},
-        "pickle_suffix": {None, str},
-    }
-
-    def __init__(
-        self,
-        mode="mixture_model",
-        genes_perturbed="all",
-        combos=0,
-        anchor_gene=None,
-        cell_states_to_model=None,
-        pickle_suffix="_raw.pickle",
-        token_dictionary_file=None,
-        gene_name_id_dictionary_file=None,
-    ):
-        """
-        Initialize in silico perturber stats generator.
-        **Parameters:**
-        mode : {"goal_state_shift", "vs_null", "mixture_model", "aggregate_data", "aggregate_gene_shifts"}
-            | Type of stats.
-            | "goal_state_shift": perturbation vs. random for desired cell state shift
-            | "vs_null": perturbation vs. null from provided null distribution dataset
-            | "mixture_model": perturbation in impact vs. no impact component of mixture model (no goal direction)
-            | "aggregate_data": aggregates cosine shifts for single perturbation in multiple cells
-            | "aggregate_gene_shifts": aggregates cosine shifts of genes in response to perturbation(s)
-        genes_perturbed : "all", list
-            | Genes perturbed in isp experiment.
-            | Default is assuming genes_to_perturb in isp experiment was "all" (each gene in each cell).
-            | Otherwise, may provide a list of ENSEMBL IDs of genes perturbed as a group all together.
-        combos : {0,1,2}
-            | Whether to perturb genes individually (0), in pairs (1), or in triplets (2).
-        anchor_gene : None, str
-            | ENSEMBL ID of gene to use as anchor in combination perturbations or in testing effect on downstream genes.
-            | For example, if combos=1 and anchor_gene="ENSG00000136574":
-            |    analyzes data for anchor gene perturbed in combination with each other gene.
-            | However, if combos=0 and anchor_gene="ENSG00000136574":
-            |    analyzes data for the effect of anchor gene's perturbation on the embedding of each other gene.
-        cell_states_to_model: None, dict
-            | Cell states to model if testing perturbations that achieve goal state change.
-            | Four-item dictionary with keys: state_key, start_state, goal_state, and alt_states
-            | state_key: key specifying name of column in .dataset that defines the start/goal states
-            | start_state: value in the state_key column that specifies the start state
-            | goal_state: value in the state_key column taht specifies the goal end state
-            | alt_states: list of values in the state_key column that specify the alternate end states
-            | For example: {"state_key": "disease",
-            |               "start_state": "dcm",
-            |               "goal_state": "nf",
-            |               "alt_states": ["hcm", "other1", "other2"]}
-        token_dictionary_file : Path
-            | Path to pickle file containing token dictionary (Ensembl ID:token).
-        gene_name_id_dictionary_file : Path
-            | Path to pickle file containing gene name to ID dictionary (gene name:Ensembl ID).
-        """
-
-        self.mode = mode
-        self.genes_perturbed = genes_perturbed
-        self.combos = combos
-        self.anchor_gene = anchor_gene
-        self.cell_states_to_model = cell_states_to_model
-        self.pickle_suffix = pickle_suffix
-
-        self.validate_options()
-
-        # load token dictionary (Ensembl IDs:token)
-        with open(token_dictionary_file, "rb") as f:
-            self.gene_token_dict = pickle.load(f)
-
-        # load gene name dictionary (gene name:Ensembl ID)
-        with open(gene_name_id_dictionary_file, "rb") as f:
-            self.gene_name_id_dict = pickle.load(f)
-
-        if anchor_gene is None:
-            self.anchor_token = None
-        else:
-            self.anchor_token = self.gene_token_dict[self.anchor_gene]
-
-    def validate_options(self):
-        for attr_name, valid_options in self.valid_option_dict.items():
-            attr_value = self.__dict__[attr_name]
-            if type(attr_value) not in {list, dict}:
-                if attr_name in {"anchor_gene"}:
-                    continue
-                elif attr_value in valid_options:
-                    continue
-            valid_type = False
-            for option in valid_options:
-                if (option in [str, int, list, dict]) and isinstance(
-                    attr_value, option
-                ):
-                    valid_type = True
-                    break
-            if not valid_type:
-                logger.error(
-                    f"Invalid option for {attr_name}. "
-                    f"Valid options for {attr_name}: {valid_options}"
-                )
-                raise
-
-        if self.cell_states_to_model is not None:
-            if len(self.cell_states_to_model.items()) == 1:
-                logger.warning(
-                    "The single value dictionary for cell_states_to_model will be "
-                    "replaced with a dictionary with named keys for start, goal, and alternate states. "
-                    "Please specify state_key, start_state, goal_state, and alt_states "
-                    "in the cell_states_to_model dictionary for future use. "
-                    "For example, cell_states_to_model={"
-                    "'state_key': 'disease', "
-                    "'start_state': 'dcm', "
-                    "'goal_state': 'nf', "
-                    "'alt_states': ['hcm', 'other1', 'other2']}"
-                )
-                for key, value in self.cell_states_to_model.items():
-                    if (len(value) == 3) and isinstance(value, tuple):
-                        if (
-                            isinstance(value[0], list)
-                            and isinstance(value[1], list)
-                            and isinstance(value[2], list)
-                        ):
-                            if len(value[0]) == 1 and len(value[1]) == 1:
-                                all_values = value[0] + value[1] + value[2]
-                                if len(all_values) == len(set(all_values)):
-                                    continue
-                # reformat to the new named key format
-                state_values = flatten_list(list(self.cell_states_to_model.values()))
-                self.cell_states_to_model = {
-                    "state_key": list(self.cell_states_to_model.keys())[0],
-                    "start_state": state_values[0][0],
-                    "goal_state": state_values[1][0],
-                    "alt_states": state_values[2:][0],
-                }
-            elif set(self.cell_states_to_model.keys()) == {
-                "state_key",
-                "start_state",
-                "goal_state",
-                "alt_states",
-            }:
-                if (
-                    (self.cell_states_to_model["state_key"] is None)
-                    or (self.cell_states_to_model["start_state"] is None)
-                    or (self.cell_states_to_model["goal_state"] is None)
-                ):
-                    logger.error(
-                        "Please specify 'state_key', 'start_state', and 'goal_state' in cell_states_to_model."
-                    )
-                    raise
-
-                if (
-                    self.cell_states_to_model["start_state"]
-                    == self.cell_states_to_model["goal_state"]
-                ):
-                    logger.error("All states must be unique.")
-                    raise
-
-                if self.cell_states_to_model["alt_states"] is not None:
-                    if not isinstance(self.cell_states_to_model["alt_states"], list):
-                        logger.error(
-                            "self.cell_states_to_model['alt_states'] must be a list (even if it is one element)."
-                        )
-                        raise
-                    if len(self.cell_states_to_model["alt_states"]) != len(
-                        set(self.cell_states_to_model["alt_states"])
-                    ):
-                        logger.error("All states must be unique.")
-                        raise
-
-            elif set(self.cell_states_to_model.keys()) == {
-                "state_key",
-                "start_state",
-                "goal_state",
-            }:
-                self.cell_states_to_model["alt_states"] = []
-            else:
-                logger.error(
-                    "cell_states_to_model must only have the following four keys: "
-                    "'state_key', 'start_state', 'goal_state', 'alt_states'."
-                    "For example, cell_states_to_model={"
-                    "'state_key': 'disease', "
-                    "'start_state': 'dcm', "
-                    "'goal_state': 'nf', "
-                    "'alt_states': ['hcm', 'other1', 'other2']}"
-                )
-                raise
-
-            if self.anchor_gene is not None:
-                self.anchor_gene = None
-                logger.warning(
-                    "anchor_gene set to None. "
-                    "Currently, anchor gene not available "
-                    "when modeling multiple cell states."
-                )
-
-        if self.combos > 0:
-            if self.anchor_gene is None:
-                logger.error(
-                    "Currently, stats are only supported for combination "
-                    "in silico perturbation run with anchor gene. Please add "
-                    "anchor gene when using with combos > 0. "
-                )
-                raise
-
-        if (self.mode == "mixture_model") and (self.genes_perturbed != "all"):
-            logger.error(
-                "Mixture model mode requires multiple gene perturbations to fit model "
-                "so is incompatible with a single grouped perturbation."
-            )
-            raise
-        if (self.mode == "aggregate_data") and (self.genes_perturbed == "all"):
-            logger.error(
-                "Simple data aggregation mode is for single perturbation in multiple cells "
-                "so is incompatible with a genes_perturbed being 'all'."
-            )
-            raise
-
-    def get_stats(
-        self,
-        input_data_directory,
-        null_dist_data_directory,
-        output_directory,
-        output_prefix,
-        null_dict_list=None,
-    ):
-        """
-        Get stats for in silico perturbation data and save as results in output_directory.
-        **Parameters:**
-        input_data_directory : Path
-            | Path to directory containing cos_sim dictionary inputs
-        null_dist_data_directory : Path
-            | Path to directory containing null distribution cos_sim dictionary inputs
-        output_directory : Path
-            | Path to directory where perturbation data will be saved as .csv
-        output_prefix : str
-            | Prefix for output .csv
-        null_dict_list: list[dict]
-            | List of loaded null distribution dictionary if more than one comparison vs. the null is to be performed
-        **Outputs:**
-        Definition of possible columns in .csv output file.
-        | Of note, not all columns will be present in all output files.
-        | Some columns are specific to particular perturbation modes.
-        | "Gene": gene token
-        | "Gene_name": gene name
-        | "Ensembl_ID": gene Ensembl ID
-        | "N_Detections": number of cells in which each gene or gene combination was detected in the input dataset
-        | "Sig": 1 if FDR<0.05, otherwise 0
-        | "Shift_to_goal_end": cosine shift from start state towards goal end state in response to given perturbation
-        | "Shift_to_alt_end": cosine shift from start state towards alternate end state in response to given perturbation
-        | "Goal_end_vs_random_pval": pvalue of cosine shift from start state towards goal end state by Wilcoxon
-        |     pvalue compares shift caused by perturbing given gene compared to random genes
-        | "Alt_end_vs_random_pval": pvalue of cosine shift from start state towards alternate end state by Wilcoxon
-        |     pvalue compares shift caused by perturbing given gene compared to random genes
-        | "Goal_end_FDR": Benjamini-Hochberg correction of "Goal_end_vs_random_pval"
-        | "Alt_end_FDR": Benjamini-Hochberg correction of "Alt_end_vs_random_pval"
-        | "Test_avg_shift": cosine shift in response to given perturbation in cells from test distribution
-        | "Null_avg_shift": cosine shift in response to given perturbation in cells from null distribution (e.g. random cells)
-        | "Test_vs_null_avg_shift": difference in cosine shift in cells from test vs. null distribution
-        |     (i.e. "Test_avg_shift" minus "Null_avg_shift")
-        | "Test_vs_null_pval": pvalue of cosine shift in test vs. null distribution
-        | "Test_vs_null_FDR": Benjamini-Hochberg correction of "Test_vs_null_pval"
-        | "N_Detections_test": "N_Detections" in cells from test distribution
-        | "N_Detections_null": "N_Detections" in cells from null distribution
-        | "Anchor_shift": cosine shift in response to given perturbation of anchor gene
-        | "Test_token_shift": cosine shift in response to given perturbation of test gene
-        | "Sum_of_indiv_shifts": sum of cosine shifts in response to individually perturbing test and anchor genes
-        | "Combo_shift": cosine shift in response to given perturbation of both anchor and test gene(s) in combination
-        | "Combo_minus_sum_shift": difference of cosine shifts in response combo perturbation vs. sum of individual perturbations
-        |     (i.e. "Combo_shift" minus "Sum_of_indiv_shifts")
-        | "Impact_component": whether the given perturbation was modeled to be within the impact component by the mixture model
-        |     1: within impact component; 0: not within impact component
-        | "Impact_component_percent": percent of cells in which given perturbation was modeled to be within impact component
-        | In case of aggregating data / gene shifts:
-        | "Perturbed": ID(s) of gene(s) being perturbed
-        | "Affected": ID of affected gene or "cell_emb" indicating the impact on the cell embedding as a whole
-        | "Cosine_sim_mean": mean of cosine similarity of cell or affected gene in original vs. perturbed
-        | "Cosine_sim_stdev": standard deviation of cosine similarity of cell or affected gene in original vs. perturbed
-        """
-
-        if self.mode not in [
-            "goal_state_shift",
-            "vs_null",
-            "mixture_model",
-            "aggregate_data",
-            "aggregate_gene_shifts",
-        ]:
-            logger.error(
-                "Currently, only modes available are stats for goal_state_shift, "
-                "vs_null (comparing to null distribution), "
-                "mixture_model (fitting mixture model for perturbations with or without impact), "
-                "and aggregating data for single perturbations or for gene embedding shifts."
-            )
-            raise
-
-        self.gene_token_id_dict = invert_dict(self.gene_token_dict)
-        self.gene_id_name_dict = invert_dict(self.gene_name_id_dict)
-
-        # obtain total gene list
-        if (self.combos == 0) and (self.anchor_token is not None):
-            # cos sim data for effect of gene perturbation on the embedding of each other gene
-            dict_list = read_dictionaries(
-                input_data_directory,
-                "gene",
-                self.anchor_token,
-                self.cell_states_to_model,
-                self.pickle_suffix,
-            )
-            gene_list = get_gene_list(dict_list, "gene")
-        elif (
-            (self.combos == 0)
-            and (self.anchor_token is None)
-            and (self.mode == "aggregate_gene_shifts")
-        ):
-            dict_list = read_dictionaries(
-                input_data_directory,
-                "gene",
-                self.anchor_token,
-                self.cell_states_to_model,
-                self.pickle_suffix,
-            )
-            gene_list = get_gene_list(dict_list, "cell")
-        else:
-            # cos sim data for effect of gene perturbation on the embedding of each cell
-            dict_list = read_dictionaries(
-                input_data_directory,
-                "cell",
-                self.anchor_token,
-                self.cell_states_to_model,
-                self.pickle_suffix,
-            )
-            gene_list = get_gene_list(dict_list, "cell")
-
-        # initiate results dataframe
-        cos_sims_df_initial = pd.DataFrame(
-            {
-                "Gene": gene_list,
-                "Gene_name": [self.token_to_gene_name(item) for item in gene_list],
-                "Ensembl_ID": [
-                    token_tuple_to_ensembl_ids(genes, self.gene_token_id_dict)
-                    if self.genes_perturbed != "all"
-                    else self.gene_token_id_dict[genes[1]]
-                    if isinstance(genes, tuple)
-                    else self.gene_token_id_dict[genes]
-                    for genes in gene_list
-                ],
-            },
-            index=[i for i in range(len(gene_list))],
-        )
+                states.append(v)
+        out = {}
+        base = Path(base_dir)
+        for s in states:
+            # expect pickles under base_dir/<state>/..._raw.pickle
+            sdir = base / str(s)
+            if sdir.is_dir():
+                out[str(s)] = self._load_and_merge(sdir)
+        return out
+
+    # main entry
+    def compute_stats(self,
+                      input_path_or_dir: str,
+                      null_path_or_dir: Optional[str],
+                      output_directory: str,
+                      output_prefix: str) -> str:
+        tok2name, tok2ens = self._tok_maps()
+
+        out_dir = Path(output_directory)
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        if self.mode == "aggregate_data":
+            merged = self._load_and_merge(input_path_or_dir)
+            out_csv = out_dir / f"{output_prefix}_aggregate_data.csv"
+            return _mode_aggregate_data(merged, tok2name, out_csv)
+
+        if self.mode == "aggregate_gene_shifts":
+            merged = self._load_and_merge(input_path_or_dir)
+            out_csv = out_dir / f"{output_prefix}_aggregate_gene_shifts.csv"
+            return _mode_aggregate_gene_shifts(merged, tok2name, out_csv, tok2ens)
+
+        if self.mode == "vs_null":
+            if null_path_or_dir is None:
+                raise ValueError("vs_null requires null_path_or_dir")
+            merged_t = self._load_and_merge(input_path_or_dir)
+            merged_n = self._load_and_merge(null_path_or_dir)
+            out_csv = out_dir / f"{output_prefix}_vs_null.csv"
+            return _mode_vs_null(merged_t, merged_n, tok2name, out_csv)
 
         if self.mode == "goal_state_shift":
-            cos_sims_df = isp_stats_to_goal_state(
-                cos_sims_df_initial,
-                dict_list,
-                self.cell_states_to_model,
-                self.genes_perturbed,
-            )
+            if not self.cell_states_to_model:
+                raise ValueError("goal_state_shift requires cell_states_to_model")
+            # Expect base_dir containing subdirs per state (names matching the config values)
+            by_state = self._load_by_state(input_path_or_dir)
+            out_csv = out_dir / f"{output_prefix}_goal_state_shift.csv"
+            return _mode_goal_state_shift(by_state, self.cell_states_to_model, tok2name, out_csv)
 
-        elif self.mode == "vs_null":
-            if null_dict_list is None:
-                null_dict_list = read_dictionaries(
-                    null_dist_data_directory,
-                    "cell",
-                    self.anchor_token,
-                    self.cell_states_to_model,
-                    self.pickle_suffix,
-                )
-            cos_sims_df = isp_stats_vs_null(
-                cos_sims_df_initial, dict_list, null_dict_list
-            )
+        if self.mode == "mixture_model":
+            merged = self._load_and_merge(input_path_or_dir)
+            out_csv = out_dir / f"{output_prefix}_mixture_model.csv"
+            return _mode_mixture_model(merged, tok2name, out_csv)
 
-        elif self.mode == "mixture_model":
-            cos_sims_df = isp_stats_mixture_model(
-                cos_sims_df_initial, dict_list, self.combos, self.anchor_token
-            )
-
-        elif self.mode == "aggregate_data":        
-            cos_sims_df = isp_aggregate_grouped_perturb(cos_sims_df_initial, dict_list, self.genes_perturbed)
-
-        elif self.mode == "aggregate_gene_shifts":
-            cos_sims_df = isp_aggregate_gene_shifts(
-                cos_sims_df_initial,
-                dict_list,
-                self.gene_token_id_dict,
-                self.gene_id_name_dict,
-            )
-
-        # save perturbation stats to output_path
-        output_path = (Path(output_directory) / output_prefix).with_suffix(".csv")
-        cos_sims_df.to_csv(output_path)
-
-    def token_to_gene_name(self, item):
-        if np.issubdtype(type(item), np.integer):
-            return self.gene_id_name_dict.get(
-                self.gene_token_id_dict.get(item, np.nan), np.nan
-            )
-        if isinstance(item, tuple):
-            return tuple(
-                [
-                    self.gene_id_name_dict.get(
-                        self.gene_token_id_dict.get(i, np.nan), np.nan
-                    )
-                    for i in item
-                ]
-            )
+        raise ValueError(f"Unknown mode: {self.mode}")
