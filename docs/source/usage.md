@@ -1,24 +1,26 @@
-# CancerStFormer
+# Usage
 
-A flexible framework for transformer-based analysis of spatial transcriptomics data. stFormer provides tools for data tokenization, pretraining, embedding extraction, in silico perturbation, and downstream classification.
+We introduce CancerStFormer, A flexible framework for transformer-based analysis of spatial transcriptomics data. stFormer provides tools for data tokenization, pretraining, embedding extraction, in silico perturbation, and downstream classification.
 
 ## Installation
 
+To use cancerstformer, first create environment, install prerequisites, and install package:
+
 ```bash
-#create a conda environment or virtual environment
+#create conda environment or virtual environment
 conda create -n cstformer python=3.10
 conda activate cstformer
 
-# Install dependencies
-pip install torch
+#Install Depenencies
+pip install torch # version compatible with your gpu/cpu
 pip install -r requirements.txt
 pip install CancerstFormer
 
-# if using deepspeed:
-pip install mpi4py, deepspeed
+# if using deepspeed
+pip install mpi4py
 ```
-
 > **Prerequisites:** Python 3.8+, OpenMPI (for deepspeed only)
+
 
 ## Model Hub
 Check out pretrained models at our hugging face repo:  [CancerStFormer](https://huggingface.co/Istrope/stFormer)
@@ -33,11 +35,6 @@ Check out pretrained models at our hugging face repo:  [CancerStFormer](https://
 | `spot` |  [spot-model](https://huggingface.co/Istrope/stFormer/tree/main/models/spot) |
 | `neighborhood` | [neighborhood-model](https://huggingface.co/Istrope/stFormer/tree/main/models/neighbor)  |
 | `sequence-classifier` |  [tissue-model](https://huggingface.co/Istrope/stFormer/tree/main/models/tissue_classifier) |
-
-
-## Publication
-
-Preprint to come: 
 
 ## Features
 
@@ -72,19 +69,3 @@ Preprint to come:
   - computes attention across layers/heads for all unique token pairs
   - filters node-edges by (weight value, weight percentile, or top n edges)
   - filters noe-edges by number of co-occuring tokens in dataset
-
-- **Utility Scripts**
-
-  - Dataset inspection: view `input_ids`, `length`, and metadata fields in Hugging Face `.dataset` files.
-  - Gene-marker extraction and ranking with Scanpy.
-  - Parallelized DE testing and outlier removal for UMAP embeddings.
-
-## Contributing
-
-Contributions are welcome! Please open issues or submit pull requests for bug fixes and new features.
-
-## License
-
-This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
-
-
