@@ -1,51 +1,5 @@
 #!/usr/bin/env python3
-"""
-classifier.py
 
-GenericClassifier: A flexible classification utility for tokenized datasets.
-
-This module defines the GenericClassifier class, which provides methods to:
-  - Prepare a tokenized dataset for classification based on a metadata column.
-  - Split a single dataset into train/validation/test sets
-  - Train a Hugging Face Transformer model for sequence classification.
-  - Optionally tune hyperparameters with Ray Tune.
-  - Evaluate the trained model.
-  - Plot confusion matrices and predictions.
-
-Example usage:
-    from classifier import GenericClassifier
-
-    # Auto-split with stratification on the generated 'label' column:
-    classifier = GenericClassifier(metadata_column="cell_state")
-    classifier.prepare_data("data/cells.dataset", "tmp", "cells")
-    trainer = classifier.train(
-        model_checkpoint="bert-base-uncased",
-        dataset_path="tmp/cells_labeled.dataset",
-        output_directory="models/cells_model",
-        test_size=0.2,
-    )
-
-    # Provide separate train & eval datasets:
-    trainer = classifier.train(
-        model_checkpoint="bert-base-uncased",
-        dataset_path="tmp/train.dataset",
-        eval_dataset_path="tmp/eval.dataset",
-        output_directory="models/cells_model"
-    )
-
-    # Ray Tune with auto-split:
-    classifier = GenericClassifier(
-        metadata_column="cell_state",
-        ray_config={"learning_rate":[1e-5,5e-5],"num_train_epochs":[2,3]},
-    )
-    best = classifier.train(
-        model_checkpoint="bert-base-uncased",
-        dataset_path="tmp/cells_labeled.dataset",
-        output_directory="models/tuned",
-        n_trials=10,
-        test_size=0.2,
-    )
-"""
 import os
 import pickle
 import logging
@@ -64,9 +18,9 @@ from transformers import (
     AutoModelForTokenClassification
 )
 
-import stFormer.classifier.classifier_utils as cu
-import stFormer.classifier.evaluation_utils as eu
-from stFormer.classifier.classifier_utils import DataCollatorForGeneClassification
+import classifier_utils as cu
+import evaluation_utils as eu
+from classifier_utils import DataCollatorForGeneClassification
 
 logger = logging.getLogger(__name__)
 logging.getLogger("transformers.modeling_utils").setLevel(logging.ERROR)
@@ -81,8 +35,8 @@ def build_custom_tokenizer(token_dict_path: str,
     tokenizer = PreTrainedTokenizerFast(
         vocab=vocab,
         unk_token="<unk>",
-        pad_token=pad_token,
-        mask_token=mask_token,
+        pad_token="<pad>",
+        mask_token="<mask>",
         cls_token="<cls>",
         sep_token="<sep>"
     )
@@ -126,21 +80,23 @@ class GenericClassifier:
     def __init__(
         self,
         metadata_column,
-        classifier_type:str = 'sequence',
+        model_mode: str = 'spot',            # "spot" or "extended"
+        classifier_type: str = 'sequence',
         gene_class_dict=None,
         label_mapping=None,
-        token_dictionary_file = None,
+        token_dictionary_file=None,
         filter_data=None,
-        rare_threshold=0.0,
+        rare_threshold: float = 0.0,
         max_examples=None,
         max_examples_per_class=None,
         training_args=None,
         ray_config=None,
-        freeze_layers=0,
-        forward_batch_size=32,
-        nproc=4
+        freeze_layers: int = 0,
+        forward_batch_size: int = 32,
+        nproc: int = 4,
     ):
         self.metadata_column = metadata_column
+        self.model_mode = model_mode
         self.classifier_type = classifier_type
         self.gene_class_dict = gene_class_dict
         self.label_mapping = label_mapping or {}
@@ -148,29 +104,36 @@ class GenericClassifier:
         self.rare_threshold = rare_threshold
         self.max_examples = max_examples
         self.max_examples_per_class = max_examples_per_class
-        if training_args is None:
-            self.training_args = self.default_training_args
-        else:
-            self.training_args = training_args
+        self.training_args = training_args if training_args is not None else self.default_training_args
         self.ray_config = ray_config
         self.freeze_layers = freeze_layers
         self.forward_batch_size = forward_batch_size
         self.nproc = nproc
+
         if token_dictionary_file is None and classifier_type != 'sequence':
             raise Exception('If using gene classifier, please provide token dictionary file for mapping')
         self.token_dictionary_file = token_dictionary_file
 
     def prepare_data(self, input_data_file, output_directory, output_prefix):
         """
-        Prepare dataset: filter, downsample, map metadata to 'label', and save.
+        Prepare dataset: filter, downsample, map metadata to 'label'/'labels', and save.
 
+        - For sequence classification: creates a single 'label' per example.
+        - For gene (token) classification:
+            * In 'spot' mode: supervise all tokens.
+            * In 'extended' mode: mask tokens after the midpoint of each sequence (len//2) via -100.
+            (Midpoint masking is implemented inside cu.label_classes based on self.model_mode.)
         Returns:
             tuple(str, str): Paths to saved dataset and label mapping.
         """
         data = cu.load_and_filter(self.filter_data, self.nproc, input_data_file)
-        os.makedirs(output_directory,exist_ok=True)
+        os.makedirs(output_directory, exist_ok=True)
+
+        # Will fill this below and persist to disk
+        label_map = None
 
         if self.classifier_type == 'sequence':
+            # remove rare, downsample/shuffle
             data = cu.remove_rare(data, self.rare_threshold, self.metadata_column, self.nproc)
             data = cu.downsample_and_shuffle(
                 data,
@@ -188,28 +151,35 @@ class GenericClassifier:
             def _map(ex):
                 ex['label'] = label_map[ex[self.metadata_column]]
                 return ex
+
             data = data.map(_map, num_proc=self.nproc)
-        else: #token classification
-            data,label_map = cu.label_classes(
-                classifier = 'gene',
-                data = data,
-                class_dict = self.gene_class_dict,
-                token_dict_path = self.token_dictionary_file,
-                nproc = self.nproc
+
+        else:  # token (gene) classification
+            data, label_map = cu.label_classes(
+                classifier='gene',
+                data=data,
+                class_dict=self.gene_class_dict,
+                token_dict_path=self.token_dictionary_file,
+                nproc=self.nproc,
+                model_mode=self.model_mode,   # <-- key change: wires in midpoint masking when 'extended'
             )
             self.label_mapping = label_map
+
+        # Persist mapping + dataset
         self.label_mapping = label_map
         map_path = Path(output_directory) / f"{output_prefix}_id_class_dict.pkl"
         with open(map_path, 'wb') as f:
             pickle.dump(label_map, f)
+
         ds_path = Path(output_directory) / f"{output_prefix}_labeled.dataset"
         data.save_to_disk(str(ds_path))
         logger.info("Data prep complete.")
         return str(ds_path), str(map_path)
+
     
     def _load_tokenizer(self, name_or_path):
         p = Path(name_or_path)
-        if p.suffix == '.pkl' and p.exists():
+        if p.suffix in ['.pickle','.pkl'] and p.exists():
             return build_custom_tokenizer(str(p))
         try:
             return AutoTokenizer.from_pretrained(name_or_path)
@@ -326,7 +296,8 @@ class GenericClassifier:
         output_directory,
         eval_dataset_path,
         n_trials,
-        test_size
+        test_size,
+        tokenizer_name_or_path: str = None
     ):
         import os
         from pathlib import Path
@@ -343,7 +314,7 @@ class GenericClassifier:
             Trainer,
             TrainingArguments
         )
-        import stFormer.classifier.evaluation_utils as eu
+        import evaluation_utils as eu
 
         #  Normalize and resolve paths 
         ckpt = Path(model_checkpoint)
@@ -395,32 +366,48 @@ class GenericClassifier:
         #  Model init function 
         def model_init():
             device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
             config = AutoConfig.from_pretrained(
                 model_checkpoint,
                 num_labels=len(self.label_mapping),  # override the final head size to match our sequence (different classification task)
             )
-            model = AutoModelForSequenceClassification.from_pretrained(
-                model_checkpoint,
-                config=config,
-                local_files_only=True,
-                ignore_mismatched_sizes=True # if you're replacing an old head
-            )
+            if self.classifier_type == "token": #gene classification
+                # token classification head
+                config.num_labels = len(self.gene_class_dict)  # or self.num_labels
+                model = AutoModelForTokenClassification.from_pretrained(
+                    model_checkpoint,
+                    config=config,
+                    ignore_mismatched_sizes=True,
+                )
+            else:
+                # sequence classification head
+                config.num_labels = len(self.gene_class_dict)
+                model = AutoModelForSequenceClassification.from_pretrained(
+                    model_checkpoint,
+                    config=config,
+                    ignore_mismatched_sizes=True,
+                )
             if self.freeze_layers:
                 for layer in model.bert.encoder.layer[: self.freeze_layers]:
                     for p in layer.parameters():
                         p.requires_grad = False
             return model.to(device)
 
-        #  Tokenizer & collator 
-        tokenizer = AutoTokenizer.from_pretrained(
-            model_checkpoint,
-            local_files_only=local_files_only
-        )
-        collator = DataCollatorWithPadding(
-            tokenizer,
-            padding="max_length",
-            max_length=tokenizer.model_max_length
-        )
+        #  Tokenizer & collator
+        tok_src = tokenizer_name_or_path or model_checkpoint
+        tokenizer = self._load_tokenizer(tok_src)
+        if self.classifier_type == 'token':
+            from classifier_utils import DataCollatorForGeneClassification
+            collator = DataCollatorForGeneClassification(
+                tokenizer,
+                padding="longest",
+                max_length=tokenizer.model_max_length,
+                label_pad_token_id=-100,
+                return_tensors="pt",
+            )
+        else:
+            from transformers import DataCollatorWithPadding
+            collator = DataCollatorWithPadding(tokenizer=tokenizer)
 
         #  Reporter for CLI progress 
         reporter = CLIReporter(
