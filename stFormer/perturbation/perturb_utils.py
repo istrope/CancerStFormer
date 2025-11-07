@@ -1,818 +1,802 @@
-import itertools as it
+from __future__ import annotations
+
+import json
 import logging
-import pickle
-from collections import defaultdict
-from typing import List
+import math
+import os
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, Iterable, Iterator, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
-import pandas as pd
-import seaborn as sns
 import torch
 from datasets import Dataset, load_from_disk
 from transformers import (
-    BertForMaskedLM,
-    BertForSequenceClassification,
-    BertForTokenClassification,
+    AutoConfig,
+    AutoModel,
+    AutoModelForMaskedLM,
+    AutoModelForSequenceClassification,
 )
+import torch.nn.functional as F
 
-sns.set()
+from collections import defaultdict
+import pickle
 logger = logging.getLogger(__name__)
 
 
-# load data and filter by defined criteria
-def load_and_filter(filter_data, nproc, input_data_file):
-    data = load_from_disk(input_data_file)
-    if filter_data is not None:
-        data = filter_by_dict(data, filter_data, nproc)
+# ============================================================================
+# Dataset helpers
+# ============================================================================
+
+def load_and_filter_dataset(filter_data: Optional[dict], nproc: int, input_data_file: str) -> Dataset:
+    """
+    Load a huggingface `Dataset` from disk and apply optional metadata filtering.
+    """
+    data: Dataset = load_from_disk(input_data_file)
+    if filter_data:
+        data = filter_by_metadata(data, filter_data, nproc)
     return data
 
 
-def filter_by_dict(data, filter_data, nproc):
-    for key, value in filter_data.items():
-        data = data.filter(lambda example: example[key] in value, num_proc=nproc)
+def filter_by_metadata(data: Dataset, filter_data: dict, nproc: int) -> Dataset:
+    """
+    Keep rows where each key's value is in the provided list.
+    """
+    for key, vals in filter_data.items():
+        if not isinstance(vals, list):
+            vals = [vals]
+        data = data.filter(lambda ex: ex.get(key) in vals, num_proc=nproc)
     if len(data) == 0:
-        logger.error("No cells remain after filtering. Check filtering criteria.")
-        raise
+        raise ValueError("No rows remain after metadata filtering; check `filter_data`.")
     return data
 
 
-def filter_data_by_tokens(filtered_input_data, tokens, nproc):
-    def if_has_tokens(example):
-        return len(set(example["input_ids"]).intersection(tokens)) == len(tokens)
-    filtered_input_data = filtered_input_data.filter(if_has_tokens, num_proc=nproc)
-    return filtered_input_data
+def filter_by_start_state(data: Dataset, state_dict: dict, nproc: int) -> Dataset:
+    """
+    Keep rows whose `state_key` (specified in `state_dict['state_key']`) equals desired values.
+    """
+    key = state_dict.get("state_key")
+    if key is None:
+        return data
+    wants = []
+    for k, v in state_dict.items():
+        if k == "state_key":
+            continue
+        if isinstance(v, list):
+            wants.extend(v)
+        else:
+            wants.append(v)
+
+    return data.filter(lambda ex: ex.get(key) in wants, num_proc=nproc)
 
 
-def logging_filtered_data_len(filtered_input_data, filtered_tokens_categ):
-    if len(filtered_input_data) == 0:
-        logger.error(f"No cells in dataset contain {filtered_tokens_categ}.")
-        raise
-    else: logger.info(f"# cells with {filtered_tokens_categ}: {len(filtered_input_data)}")
-
-def filter_data_by_tokens_and_log(
-    filtered_input_data, tokens, nproc, filtered_tokens_categ
-):
-    filtered_input_data = filter_data_by_tokens(filtered_input_data, tokens, nproc)
-    logging_filtered_data_len(filtered_input_data, filtered_tokens_categ)
-    return filtered_input_data
+def slice_by_indices_to_perturb(data: Dataset, inds: dict) -> Dataset:
+    """
+    Return a contiguous slice from 'start' (inclusive) to 'end' (exclusive).
+    """
+    start = int(inds.get("start", 0))
+    end = int(inds.get("end", len(data)))
+    if start < 0 or end <= start or start >= len(data):
+        raise ValueError(f"Invalid slice range: start={start}, end={end}, len={len(data)}")
+    end = min(end, len(data))
+    return data.select(range(start, end))
 
 
-def filter_data_by_start_state(filtered_input_data, cell_states_to_model, nproc):
-    # confirm that start state is valid to prevent futile filtering
-    state_key = cell_states_to_model["state_key"]
-    state_values = filtered_input_data[state_key]
-    start_state = cell_states_to_model["start_state"]
-    if start_state not in state_values:
-        logger.error(
-            f"Start state {start_state} is not present "
-            f"in the dataset's {state_key} attribute."
+def downsample_and_sort(data: Dataset, max_ncells: int) -> Dataset:
+    """
+    Trim to at most `max_ncells`, preserving original order (stable head).
+    """
+    if max_ncells is None or len(data) <= max_ncells:
+        return data
+    return data.select(range(int(max_ncells)))
+
+
+# ============================================================================
+# Model helpers
+# ============================================================================
+
+def load_model_to_device(model_type: str, num_classes: int, model_directory: str, mode: str = "eval"):
+    """
+    Load a model from directory according to `model_type`.
+    Expects the model directory to be a HF checkpoint with config.
+    """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if model_type == "Pretrained":
+        model = AutoModel.from_pretrained(model_directory, output_hidden_states=True)
+    elif model_type == "GeneClassifier" or model_type == "CellClassifier":
+        # sequence/classification heads with hidden states
+        model = AutoModelForSequenceClassification.from_pretrained(
+            model_directory, num_labels=int(num_classes), output_hidden_states=True
         )
-        raise
-    def filter_for_origin(example):
-        return example[state_key] in [start_state]
-    filtered_input_data = filtered_input_data.filter(filter_for_origin, num_proc=nproc)
-    return filtered_input_data
-
-
-def slice_by_inds_to_perturb(dataset, inds):
-    start, end = inds["start"], inds["end"]
-    n = len(dataset)
-    if start >= n:
-        logger.error(f"Start index ({start}) out of range (dataset size {n}).")
-        raise IndexError(f"cell_inds_to_perturb['start'] ({start}) >= dataset length ({n})")
-    if end > n:
-        logger.warning(f"End index ({end}) exceeds dataset length ({n}); clipping to {n}.")
-        end = n
-    return dataset.select(range(start, end))
-
-
-def load_model(model_type, num_classes, model_directory, mode):
-    output_hidden_states = (mode == "eval")
-    cls_map = {
-        "Pretrained": (BertForMaskedLM,{}),
-        "GeneClassifier": (BertForTokenClassification,{"num_labels": num_classes}),
-        "CellClassifier": (BertForSequenceClassification,{"num_labels": num_classes}),
-    }
-    ModelClass, extra_args = cls_map.get(model_type, (None, None))
-    if ModelClass is None:
-        raise ValueError(f"Unknown model_type: {model_type!r}")
-    model = ModelClass.from_pretrained(
-        model_directory,
-        output_hidden_states=output_hidden_states,
-        output_attentions=False,
-        **extra_args
-    )
+    else:
+        raise ValueError(f"Unsupported model_type={model_type!r}")
+    model.to(device)
     if mode == "eval":
         model.eval()
-    return model.to("cuda")
-
-def quant_layers(model):
-    layer_nums = []
-    for name, parameter in model.named_parameters():
-        if "layer" in name:
-            layer_nums += [int(name.split("layer.")[1].split(".")[0])]
-    return int(max(layer_nums)) + 1
-def get_model_emb_dims(model):
-    return model.config.hidden_size
-def get_model_input_size(model):
-    return model.config.max_position_embeddings
-def flatten_list(megalist):
-    return [item for sublist in megalist for item in sublist]
-def measure_length(example):
-    example["length"] = len(example["input_ids"])
-    return example
+    return model
 
 
-def downsample_and_sort(data, max_ncells):
-    num_cells = len(data)
-    if max_ncells is not None:
-        if num_cells > max_ncells:
-            data = data.shuffle(seed=42)
-            num_cells = max_ncells
-    data_subset = data.select([i for i in range(num_cells)])
-    data_sorted = data_subset.sort("length", reverse=True)
-    return data_sorted
-
-def stratified_downsample_and_sort(data, max_ncells, stratify_by):
-    num_cells = len(data)
-    if max_ncells is not None and num_cells > max_ncells:
-        unique_labels = data.unique(stratify_by)
-        per_group_count = max_ncells // len(unique_labels)
-        sampled_indices = []
-        for label in unique_labels:
-            label_indices = [i for i, val in enumerate(data[stratify_by]) if val == label]
-            np.random.seed(42)
-            shuffled_indices = np.random.permutation(label_indices)
-            sampled_indices.extend(shuffled_indices[:per_group_count])
-        sampled_indices = np.random.permutation(sampled_indices)[:max_ncells]
-        data = data.select(sampled_indices)
-    data_sorted = data.sort("length", reverse=True)
-    return data_sorted
-
-def get_possible_states(cell_states_to_model):
-    possible_states = []
-    for key in ["start_state", "goal_state"]:
-        possible_states += [cell_states_to_model[key]]
-    possible_states += cell_states_to_model.get("alt_states", [])
-    return possible_states
-
-
-def forward_pass_single_cell(model, example_cell, layer_to_quant):
-    example_cell.set_format(type="torch")
-    input_data = example_cell["input_ids"]
-    with torch.no_grad():
-        outputs = model(input_ids=input_data.to("cuda"))
-    emb = torch.squeeze(outputs.hidden_states[layer_to_quant])
-    del outputs
-    return emb
-
-
-def perturb_emb_by_index(emb, indices):
-    mask = torch.ones(emb.numel(), dtype=torch.bool)
-    mask[indices] = False
-    return emb[mask]
-
-
-def delete_indices(example):
-    indices = example["perturb_index"]
-    if any(isinstance(el, list) for el in indices):
-        indices = flatten_list(indices)
-    for index in sorted(indices, reverse=True):
-        del example["input_ids"][index]
-
-    example["length"] = len(example["input_ids"])
-    return example
-
-
-# for genes_to_perturb = "all" where only genes within cell are overexpressed
-def overexpress_indices(example):
-    indices = example["perturb_index"]
-    if any(isinstance(el, list) for el in indices):
-        indices = flatten_list(indices)
-    for index in sorted(indices, reverse=True):
-        example["input_ids"].insert(0, example["input_ids"].pop(index))
-
-    example["length"] = len(example["input_ids"])
-    return example
-
-def check_batch_inputs(orig_batch,pert_batch,start,end,perturb_type,):
-    for i in range(len(orig_batch["input_ids"])):
-        orig_tokens = orig_batch["input_ids"][i]
-        pert_tokens = pert_batch["input_ids"][i]
-
-        # Either full match or (for delete perturbations) perturbed should be a subset
-        if perturb_type == "delete":
-            if not set(pert_tokens).issubset(set(orig_tokens)):
-                print(f"Mismatch in DELETE at index {start + i}")
-                print("Original:", orig_tokens)
-                print("Perturbed:", pert_tokens)
-                raise ValueError("Perturbed tokens are not a subset of original tokens.")
-        else:  # Overexpress
-            # Overexpress should preserve the original tokens somewhere after the perturb
-            missing = [t for t in orig_tokens if t not in pert_tokens]
-            if missing:
-                print(f"Mismatch in OVEREXPRESS at index {start + i}")
-                print("Original:", orig_tokens)
-                print("Perturbed:", pert_tokens)
-                print("Missing tokens from perturbed:", missing)
-                raise ValueError("Original tokens missing from perturbed batch.")
-            
-def check_embedding_shapes(pert_emb,original_emb,orig_batch,pert_batch,start,end):
-    if pert_emb.shape[1] != original_emb.shape[1]:
-        print("---- Shape mismatch detected ----")
-        print(f"pert_emb shape: {pert_emb.shape}")
-        print(f"original_emb shape: {original_emb.shape}")
-        print(f"Batch indices {start} to {end}")
-        print(f"Original lengths: {orig_batch['length']}")
-        print(f"Perturbed lengths: {pert_batch['length']}")
-        for i in range(len(orig_batch["input_ids"])):
-            print(f"Sample {i} orig tokens ({len(orig_batch['input_ids'][i])}): {orig_batch['input_ids'][i]}")
-            print(f"Sample {i} pert tokens ({len(pert_batch['input_ids'][i])}): {pert_batch['input_ids'][i]}")
-        raise ValueError("Embedding dimensions do not match. Aborting.")
-
-def align_perturbed_embeddings(full_pert, orig_batch, pert_batch, tokens_to_perturb):
+def quant_layers(model) -> int:
     """
-    Align perturbed embeddings to original embeddings by removing the first occurrence 
-    of each overexpressed token, if sequence length increased. Pads to batch max length.
+    Return number of hidden layers to allow negative indexing (-1 = last layer).
     """
-    aligned_pert_emb = []
-
-    for i in range(full_pert.shape[0]):
-        orig_tokens = orig_batch["input_ids"][i]
-        pert_tokens = pert_batch["input_ids"][i]
-        pert_emb_sample = full_pert[i]
-
-        orig_len = orig_batch["length"][i]
-        pert_len = pert_batch["length"][i]
-
-        pert_tokens_mod = list(pert_tokens)  # Explicitly create new list
-
-        length_increase = pert_len - orig_len
-
-        removed = 0
-        for token in tokens_to_perturb:
-            if length_increase > 0 and token in pert_tokens_mod:
-                index_to_remove = pert_tokens_mod.index(token)
-
-                # Sanity check before removal
-                if index_to_remove >= pert_emb_sample.shape[0]:
-                    raise ValueError(
-                        f"Sample {i}: Token index {index_to_remove} exceeds embedding length {pert_emb_sample.shape[0]}"
-                    )
-
-                pert_tokens_mod.pop(index_to_remove)
-                pert_emb_sample = torch.cat((
-                    pert_emb_sample[:index_to_remove, :],
-                    pert_emb_sample[index_to_remove+1:, :]
-                ), dim=0)
-
-                length_increase -= 1
-                removed += 1
-
-        # Sanity check after all removals
-        if len(pert_tokens_mod) != pert_emb_sample.shape[0]:
-            raise ValueError(
-                f"Sample {i}: Token list length {len(pert_tokens_mod)} does not match embedding length {pert_emb_sample.shape[0]}"
-            )
-
-        # Truncate or pad to match original length
-        if len(pert_tokens_mod) > orig_len:
-            pert_emb_sample = pert_emb_sample[:orig_len, :]
-        elif len(pert_tokens_mod) < orig_len:
-            pad_size = orig_len - len(pert_tokens_mod)
-            padding = pert_emb_sample.new_zeros((pad_size, pert_emb_sample.shape[1]))
-            pert_emb_sample = torch.cat([pert_emb_sample, padding], dim=0)
-
-        aligned_pert_emb.append(pert_emb_sample)
-
-    return torch.stack(aligned_pert_emb)
-
-
-# for genes_to_perturb = list of genes to overexpress that are not necessarily expressed in cell
-def overexpress_tokens(example, max_len):
-    # -100 indicates tokens to overexpress are not present in rank value encoding
-    if example["perturb_index"] != [-100]:
-        example = delete_indices(example)
-    [
-        example["input_ids"].insert(0, token)
-        for token in example["tokens_to_perturb"][::-1]
-    ]
-
-    # truncate to max input size, must also truncate original emb to be comparable
-    if len(example["input_ids"]) > max_len:
-        example["input_ids"] = example["input_ids"][0:max_len]
-
-    example["length"] = len(example["input_ids"])
-    return example
-
-def calc_n_overflow(max_len, example_len, tokens_to_perturb, indices_to_perturb):
-    n_to_add = len(tokens_to_perturb) - len(indices_to_perturb)
-    n_overflow = example_len + n_to_add - max_len
-    return n_overflow
-
-
-def truncate_by_n_overflow(example):
-    new_max_len = example["length"] - example["n_overflow"]
-    example["input_ids"] = example["input_ids"][0:new_max_len]
-    example["length"] = len(example["input_ids"])
-    return example
-
-
-def remove_indices_from_emb(emb, indices_to_remove, gene_dim):
-    # indices_to_remove is list of indices to remove
-    indices_to_keep = [
-        i for i in range(emb.size()[gene_dim]) if i not in indices_to_remove
-    ]
-    num_dims = emb.dim()
-    emb_slice = [
-        slice(None) if dim != gene_dim else indices_to_keep for dim in range(num_dims)
-    ]
-    sliced_emb = emb[emb_slice]
-    return sliced_emb
-
-
-def remove_indices_from_emb_batch(emb_batch, list_of_indices_to_remove, gene_dim):
-    output_batch_list = [
-        remove_indices_from_emb(emb_batch[i, :, :], idxes, gene_dim - 1)
-        for i, idxes in enumerate(list_of_indices_to_remove)
-    ]
-    # add padding given genes are sometimes added that are or are not in original cell
-    batch_max = max([emb.size()[gene_dim - 1] for emb in output_batch_list])
-    output_batch_list_padded = [
-        pad_xd_tensor(emb, 0.000, batch_max, gene_dim - 1) for emb in output_batch_list
-    ]
-    return torch.stack(output_batch_list_padded)
-
-
-# removes perturbed indices
-def remove_perturbed_indices_set(
-    emb,
-    perturb_type: str,
-    indices_to_perturb: List[List],
-    tokens_to_perturb: List[List],
-    original_lengths: List[int],
-    input_ids=None,
-):
-    if perturb_type == "overexpress":
-        num_perturbed = len(tokens_to_perturb)
-        if num_perturbed == 1:
-            indices_to_perturb_orig = [
-                idx if idx != [-100] else [None] for idx in indices_to_perturb
-            ]
-            if all(v is [None] for v in indices_to_perturb_orig):
-                return emb
-        else:
-            indices_to_perturb_orig = []
-            for idx_list in indices_to_perturb:
-                indices_to_perturb_orig.append([idx if idx != [-100] else [None] for idx in idx_list])
-    else:
-        indices_to_perturb_orig = indices_to_perturb
-    emb = remove_indices_from_emb_batch(emb, indices_to_perturb_orig, gene_dim=1)
-
-    return emb
-
-
-def make_perturbation_batch(
-    example_cell, perturb_type, tokens_to_perturb, anchor_token, combo_lvl, num_proc
-) -> tuple[Dataset, List[int]]:
-    if combo_lvl == 0 and tokens_to_perturb == "all":
-        if perturb_type in ["overexpress", "activate"]:
-            range_start = 1
-        elif perturb_type in ["delete", "inhibit"]:
-            range_start = 0
-        indices_to_perturb = [
-            [i] for i in range(range_start, example_cell["length"][0])
-        ]
-    # elif combo_lvl > 0 and anchor_token is None:
-    ## to implement
-    elif combo_lvl > 0 and (anchor_token is not None):
-        example_input_ids = example_cell["input_ids"][0]
-        anchor_index = example_input_ids.index(anchor_token[0])
-        indices_to_perturb = [
-            sorted([anchor_index, i]) if i != anchor_index else None
-            for i in range(example_cell["length"][0])
-        ]
-        indices_to_perturb = [item for item in indices_to_perturb if item is not None]
-    else:
-        example_input_ids = example_cell["input_ids"][0]
-        indices_to_perturb = [
-            [example_input_ids.index(token)] if token in example_input_ids else None
-            for token in tokens_to_perturb
-        ]
-        indices_to_perturb = [item for item in indices_to_perturb if item is not None]
-
-    # create all permutations of combo_lvl of modifiers from tokens_to_perturb
-    if combo_lvl > 0 and (anchor_token is None):
-        if tokens_to_perturb != "all":
-            if len(tokens_to_perturb) == combo_lvl + 1:
-                indices_to_perturb = [
-                    list(x) for x in it.combinations(indices_to_perturb, combo_lvl + 1)
-                ]
-        else:
-            all_indices = [[i] for i in range(example_cell["length"][0])]
-            all_indices = [
-                index for index in all_indices if index not in indices_to_perturb
-            ]
-            indices_to_perturb = [
-                [[j for i in indices_to_perturb for j in i], x] for x in all_indices
-            ]
-
-    length = len(indices_to_perturb)
-    perturbation_dataset = Dataset.from_dict(
-        {
-            "input_ids": example_cell["input_ids"] * length,
-            "perturb_index": indices_to_perturb,
-        }
-    )
-
-    if length < 400:
-        num_proc_i = 1
-    else:
-        num_proc_i = num_proc
-
-    if perturb_type == "delete":
-        perturbation_dataset = perturbation_dataset.map(
-            delete_indices, num_proc=num_proc_i
-        )
-    elif perturb_type == "overexpress":
-        perturbation_dataset = perturbation_dataset.map(
-            overexpress_indices, num_proc=num_proc_i
-        )
-
-    perturbation_dataset = perturbation_dataset.map(measure_length, num_proc=num_proc_i)
-
-    return perturbation_dataset, indices_to_perturb
-
-
-# perturbed cell emb removing the activated/overexpressed/inhibited gene emb
-# so that only non-perturbed gene embeddings are compared to each other
-# in original or perturbed context
-def make_comparison_batch(original_emb_batch, indices_to_perturb, perturb_group):
-    all_embs_list = []
-
-    # if making comparison batch for multiple perturbations in single cell
-    if perturb_group is False:
-        # squeeze if single cell
-        if original_emb_batch.ndim == 3 and original_emb_batch.size()[0] == 1:
-            original_emb_batch = torch.squeeze(original_emb_batch)
-        original_emb_list = [original_emb_batch] * len(indices_to_perturb)
-    # if making comparison batch for single perturbation in multiple cells
-    elif perturb_group is True:
-        original_emb_list = original_emb_batch
-
-    for original_emb, indices in zip(original_emb_list, indices_to_perturb):
-        if indices == [-100]:
-            all_embs_list += [original_emb[:]]
-            continue
-
-        emb_list = []
-        start = 0
-        if any(isinstance(el, list) for el in indices):
-            indices = flatten_list(indices)
-
-        # removes indices that were perturbed from the original embedding
-        for i in sorted(indices):
-            emb_list += [original_emb[start:i]]
-            start = i + 1
-
-        emb_list += [original_emb[start:]]
-        all_embs_list += [torch.cat(emb_list)]
-
-    len_set = set([emb.size()[0] for emb in all_embs_list])
-    if len(len_set) > 1:
-        max_len = max(len_set)
-        all_embs_list = [pad_2d_tensor(emb, None, max_len, 0) for emb in all_embs_list]
-    return torch.stack(all_embs_list)
-
-
-def pad_list(input_ids, pad_token_id, max_len):
-    input_ids = np.pad(
-        input_ids,
-        (0, max_len - len(input_ids)),
-        mode="constant",
-        constant_values=pad_token_id,
-    )
-    return input_ids
-
-
-def pad_xd_tensor(tensor, pad_token_id, max_len, dim):
-    padding_length = max_len - tensor.size()[dim]
-    # Construct a padding configuration where all padding values are 0, except for the padding dimension
-    # 2 * number of dimensions (padding before and after for every dimension)
-    pad_config = [0] * 2 * tensor.dim()
-    # Set the padding after the desired dimension to the calculated padding length
-    pad_config[-2 * dim - 1] = padding_length
-    return torch.nn.functional.pad(
-        tensor, pad=pad_config, mode="constant", value=pad_token_id
-    )
-
-
-def pad_tensor(tensor, pad_token_id, max_len):
-    tensor = torch.nn.functional.pad(
-        tensor, pad=(0, max_len - tensor.numel()), mode="constant", value=pad_token_id
-    )
-
-    return tensor
-
-
-def pad_2d_tensor(tensor, pad_token_id, max_len, dim):
-    if dim == 0:
-        pad = (0, 0, 0, max_len - tensor.size()[dim])
-    elif dim == 1:
-        pad = (0, max_len - tensor.size()[dim], 0, 0)
-    tensor = torch.nn.functional.pad(
-        tensor, pad=pad, mode="constant", value=pad_token_id
-    )
-    return tensor
-
-
-def pad_3d_tensor(tensor, pad_token_id, max_len, dim):
-    if dim == 0:
-        raise Exception("dim 0 usually does not need to be padded.")
-    if dim == 1:
-        pad = (0, 0, 0, max_len - tensor.size()[dim])
-    elif dim == 2:
-        pad = (0, max_len - tensor.size()[dim], 0, 0)
-    tensor = torch.nn.functional.pad(
-        tensor, pad=pad, mode="constant", value=pad_token_id
-    )
-    return tensor
-
-
-def pad_or_truncate_encoding(encoding, pad_token_id, max_len):
-    if isinstance(encoding, torch.Tensor):
-        encoding_len = encoding.size()[0]
-    elif isinstance(encoding, list):
-        encoding_len = len(encoding)
-    if encoding_len > max_len:
-        encoding = encoding[0:max_len]
-    elif encoding_len < max_len:
-        if isinstance(encoding, torch.Tensor):
-            encoding = pad_tensor(encoding, pad_token_id, max_len)
-        elif isinstance(encoding, list):
-            encoding = pad_list(encoding, pad_token_id, max_len)
-    return encoding
-
-
-# pad list of tensors and convert to tensor
-def pad_tensor_list(
-    tensor_list,
-    dynamic_or_constant,
-    pad_token_id,
-    model_input_size,
-    dim=None,
-    padding_func=None,
-):
-    # determine maximum tensor length
-    if dynamic_or_constant == "dynamic":
-        max_len = max([tensor.squeeze().numel() for tensor in tensor_list])
-    elif isinstance(dynamic_or_constant, int):
-        max_len = dynamic_or_constant
-    else:
-        max_len = model_input_size
-        logger.warning(
-            "If padding style is constant, must provide integer value. "
-            f"Setting padding to max input size {model_input_size}."
-        )
-
-    # pad all tensors to maximum length
-    if dim is None:
-        tensor_list = [
-            pad_tensor(tensor, pad_token_id, max_len) for tensor in tensor_list
-        ]
-    else:
-        tensor_list = [
-            padding_func(tensor, pad_token_id, max_len, dim) for tensor in tensor_list
-        ]
-    # return stacked tensors
-    if padding_func != pad_3d_tensor:
-        return torch.stack(tensor_list)
-    else:
-        return torch.cat(tensor_list, 0)
-
-
-def gen_attention_mask(minibatch_encoding, max_len=None):
-    if max_len is None:
-        max_len = max(minibatch_encoding["length"])
-    original_lens = minibatch_encoding["length"]
-    attention_mask = [
-        [1] * original_len + [0] * (max_len - original_len)
-        if original_len <= max_len
-        else [1] * max_len
-        for original_len in original_lens
-    ]
-    return torch.tensor(attention_mask, device="cuda")
-
-
-# get cell embeddings excluding padding
-def mean_nonpadding_embs(embs, original_lens, dim=1):
-    # create a mask tensor based on padding lengths
-    mask = torch.arange(embs.size(dim), device=embs.device) < original_lens.unsqueeze(1)
-    if embs.dim() == 3:
-        # fill the masked positions in embs with zeros
-        masked_embs = embs.masked_fill(~mask.unsqueeze(2), 0.0)
-
-        # compute the mean across the non-padding dimensions
-        mean_embs = masked_embs.sum(dim) / original_lens.view(-1, 1).float()
-
-    elif embs.dim() == 2:
-        masked_embs = embs.masked_fill(~mask, 0.0)
-        mean_embs = masked_embs.sum(dim) / original_lens.float()
-    return mean_embs
-
-
-# get cell embeddings when there is no padding
-def compute_nonpadded_cell_embedding(embs, cell_emb_style):
-    if cell_emb_style == "mean_pool":
-        return torch.mean(embs, dim=embs.ndim - 2)
-
-
-# quantify shifts for a set of genes
-def quant_cos_sims(
-    perturbation_emb,
-    original_emb,
-    cell_states_to_model,
-    state_embs_dict,
-    emb_mode="gene",
-):
+    n = getattr(model.config, "num_hidden_layers", None)
+    if n is None and hasattr(model, "base_model") and hasattr(model.base_model, "config"):
+        n = getattr(model.base_model.config, "num_hidden_layers", None)
+    if n is None:
+        # fallback: try reading from a typical transformer stack attribute
+        n = len(getattr(model, "encoder", getattr(model, "transformer", [])).layer)
+    return int(n)
+
+
+def get_model_hidden_size(model) -> int:
+    """
+    Hidden size (embedding dimension).
+    """
+    h = getattr(model.config, "hidden_size", None) or getattr(model.config, "d_model", None)
+    if h is None and hasattr(model, "base_model"):
+        h = getattr(model.base_model.config, "hidden_size", None)
+    if h is None:
+        raise AttributeError("Unable to determine model hidden size from config.")
+    return int(h)
+
+
+def get_model_input_size(model) -> int:
+    """
+    Maximum input sequence length from config (or a conservative default).
+    """
+    max_len = getattr(model.config, "max_position_embeddings", None)
+    if max_len is None and hasattr(model, "base_model"):
+        max_len = getattr(model.base_model.config, "max_position_embeddings", None)
+    return int(max_len or 512)
+
+
+# Alias expected by other modules
+get_model_emb_dims = get_model_hidden_size
+load_model = load_model_to_device
+
+
+def quant_cos_sims_tokenwise(hid_orig: torch.Tensor, hid_pert: torch.Tensor) -> torch.Tensor:
+    # normalize on the embedding dimension (last)
+    ho = F.normalize(hid_orig, p=2, dim=-1)
+    hp = F.normalize(hid_pert, p=2, dim=-1)
+    return (ho * hp).sum(dim=-1)
+
+# Cosine similarity utilities
+def quant_cos_sims(A: torch.Tensor, B: torch.Tensor,
+                   cell_states_to_model=None, state_embs_dict=None, emb_mode="gene") -> torch.Tensor:
     if emb_mode == "gene":
-        cos = torch.nn.CosineSimilarity(dim=2)
+        # A,B: [B, L, H] -> per-gene cosine along H
+        a = torch.nn.functional.normalize(A, dim=-1)
+        b = torch.nn.functional.normalize(B, dim=-1)
+        return (a * b).sum(dim=-1)  # [B, L]
     elif emb_mode == "cell":
-        cos = torch.nn.CosineSimilarity(dim=1)
-
-    # if emb_mode == "gene", can only calculate gene cos sims
-    # against original cell anyways
-    if cell_states_to_model is None or emb_mode == "gene":
-        cos_sims = cos(perturbation_emb, original_emb).to("cuda")
-    elif cell_states_to_model is not None and emb_mode == "cell":
-        possible_states = get_possible_states(cell_states_to_model)
-        cos_sims = dict(zip(possible_states, [[] for _ in range(len(possible_states))]))
-        for state in possible_states:
-            cos_sims[state] = cos_sim_shift(
-                original_emb,
-                perturbation_emb,
-                state_embs_dict[state].to("cuda"),  # required to move to cuda here
-                cos,
-            )
-
-    return cos_sims
-
-
-# calculate cos sim shift of perturbation with respect to origin and alternative cell
-def cos_sim_shift(original_emb, perturbed_emb, end_emb, cos):
-    origin_v_end = cos(original_emb, end_emb)
-    perturb_v_end = cos(perturbed_emb, end_emb)
-
-    return perturb_v_end - origin_v_end
-
-
-def concatenate_cos_sims(cos_sims):
-    if isinstance(cos_sims, list):
-        return torch.cat(cos_sims)
+        # A,B: [B, H]
+        return torch.nn.functional.cosine_similarity(A, B, dim=-1)
     else:
-        for state in cos_sims.keys():
-            cos_sims[state] = torch.cat(cos_sims[state])
-        return cos_sims
+        raise ValueError("emb_mode must be 'gene' or 'cell'")
+    
+def remove_front_per_example(hid: torch.Tensor, k_vec: torch.Tensor) -> torch.Tensor:
+    """
+    Remove the first k[b] tokens from each row of a [B, L, D] tensor and
+    left-pad with zeros to the max remaining length in the batch.
+    """
+    B, L, D = hid.shape
+    device = hid.device
+    rows = []
+    maxL = 1
+    for b in range(B):
+        k = int(k_vec[b].item())
+        k = max(0, min(k, L)) 
+        row = hid[b, k:, :] 
+        maxL = max(maxL, row.shape[0])
+        rows.append(row)
+    out = []
+    for row in rows:
+        if row.shape[0] < maxL:
+            pad = torch.zeros(maxL - row.shape[0], row.shape[1], device=device, dtype=hid.dtype)
+            row = torch.cat([row, pad], dim=0)
+        out.append(row.unsqueeze(0))
+    return torch.cat(out, dim=0) 
+
+def remove_front_per_example_2d(ids: torch.Tensor, k_vec: torch.Tensor) -> torch.Tensor:
+    """
+    Remove the first k[b] tokens from each row of a [B, L] tensor and
+    left-pad with zeros to the max remaining length in the batch.
+    """
+    B, L = ids.shape
+    device = ids.device
+    rows = []
+    maxL = 1
+    for b in range(B):
+        k = int(k_vec[b].item())
+        k = max(0, min(k, L))
+        row = ids[b, k:]      
+        maxL = max(maxL, row.shape[0])
+        rows.append(row)
+    out = []
+    for row in rows:
+        if row.shape[0] < maxL:
+            pad = torch.zeros(maxL - row.shape[0], device=device, dtype=ids.dtype)
+            row = torch.cat([row, pad], dim=0)
+        out.append(row.unsqueeze(0))
+    return torch.cat(out, dim=0)  
+# ============================================================================
+# Padding / masking utilities
+# ============================================================================
+
+def pad_tensor_list(
+    tensors: List[torch.Tensor],
+    max_len: int,
+    pad_token_id: int,
+    model_input_size: int,
+    dim_to_pad: int = 1,
+    pad_fn=None,
+) -> torch.Tensor:
+    """
+    Pad a list of 2D/3D tensors along the token-length dimension and stack.
+    """
+    if pad_fn is None:
+        # default: 2D [B, L] pad then stack
+        padded = [torch.nn.functional.pad(t, (0, max_len - t.shape[-1]), value=pad_token_id) for t in tensors]
+        return torch.stack(padded, dim=0)
+    return pad_fn(tensors, max_len, pad_token_id, model_input_size, dim_to_pad)
+
+
+def pad_3d_tensor(
+    tensors: List[torch.Tensor],
+    max_len: int,
+    pad_token_id: int,
+    model_input_size: int,
+    dim_to_pad: int = 1,
+) -> torch.Tensor:
+    """
+    Pad a list of [L, H] or [B, L, H] tensors into a single [B, L, H] tensor.
+    """
+    out: List[torch.Tensor] = []
+    for t in tensors:
+        if t.dim() == 2:
+            t = t.unsqueeze(0)
+        L = t.shape[1]
+        if L < max_len:
+            pad_amount = max_len - L
+            pad = torch.zeros((t.shape[0], pad_amount, t.shape[2]), dtype=t.dtype, device=t.device)
+            t = torch.cat([t, pad], dim=1)
+        out.append(t)
+    return torch.cat(out, dim=0)
+
+
+def gen_attention_mask(batch: Dataset) -> torch.Tensor:
+    """
+    Build attention mask from a dataset batch that has 'length' and 'input_ids'.
+    """
+    lengths = torch.as_tensor(batch["length"])
+    max_len = int(max(lengths))
+    return gen_attention_mask_from_lengths(max_len, len(lengths))
+
+
+def gen_attention_mask_from_lengths(lengths: int, batch_size: int) -> torch.Tensor:
+    # create on CPU; ModelAdapter.forward will move to model device
+    return torch.ones((batch_size, int(lengths)), dtype=torch.long)
+
+def mean_nonpadding_embs(embs: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+    """
+    Mean-pool embeddings over the first `lengths` tokens (per row).
+    Expects `embs` shape [B, L, H] and `lengths` as [B].
+    """
+    B, L, H = embs.shape
+    device = embs.device
+    rng = torch.arange(L, device=device).unsqueeze(0).expand(B, L)
+    mask = (rng < lengths.unsqueeze(1)).float().unsqueeze(-1)  # [B, L, 1]
+    summed = (embs * mask).sum(dim=1)  # [B, H]
+    denom = mask.sum(dim=1).clamp_min(1.0)  # [B, 1]
+    return summed / denom
+
+
+# ============================================================================
+# HF-style adapters for batching & forward pass
+# ============================================================================
+
+@dataclass
+class BatchMaker:
+    pad_token_id: int
+    model_input_size: int
+    batch_size: int = 64
+
+    def iter(self, data: Dataset, with_indices: bool = False, progress_desc: Optional[str] = None):
+        """
+        Yield dict batches with 'input_ids', 'attention_mask', and 'lengths'.
+        """
+        total = len(data)
+        for start in range(0, total, self.batch_size):
+            end = min(start + self.batch_size, total)
+            batch = data.select(range(start, end))
+            # infer max_len
+            max_len = max(int(x) for x in batch["length"])
+            # format to tensors
+            batch.set_format(type="torch")
+            ids = batch["input_ids"]
+            ids = pad_tensor_list(ids, max_len, self.pad_token_id, self.model_input_size)
+            attn = gen_attention_mask_from_lengths(max_len, ids.shape[0])
+            lens = torch.as_tensor(batch["length"], device=ids.device)
+            yield {"input_ids": ids, "attention_mask": attn, "lengths": lens}
+
+
+class ModelAdapter:
+    """
+    Small collection of static helpers to interact with models consistently.
+    """
+
+    # discovery
+    @staticmethod
+    def get_pad_token_id(model) -> int:
+        return int(getattr(getattr(model, "config", None), "pad_token_id", 0) or 0)
+
+    @staticmethod
+    def get_model_input_size(model) -> int:
+        return get_model_input_size(model)
+
+    @staticmethod
+    def quant_layers(model) -> int:
+        return quant_layers(model)
+
+    # forward/layer selection
+    @staticmethod
+    def forward(model, batch: Dict[str, torch.Tensor]):
+        # NEW: ensure inputs live on same device as model
+        device = next(model.parameters()).device
+        ids = batch["input_ids"].to(device)
+        attn = batch["attention_mask"].to(device)
+        return model(input_ids=ids, attention_mask=attn) 
+
+    @staticmethod
+    def pick_layer(outputs, layer_index: int) -> torch.Tensor:
+        return outputs.hidden_states[layer_index]
+
+    # pooling
+    @staticmethod
+    def pool_mean(embs: torch.Tensor, lengths: torch.Tensor,
+                  exclude_cls: bool = False, exclude_eos: bool = False) -> torch.Tensor:
+        # NEW: keep lengths on same device as embs
+        lengths = lengths.to(embs.device)
+
+        if exclude_cls:
+            embs = embs[:, 1:, :]
+            lengths = lengths - 1
+        if exclude_eos:
+            embs = embs[:, :-1, :]
+            lengths = lengths - 1
+        return mean_nonpadding_embs(embs, lengths)
+
+# ============================================================================
+# Perturbation operators (group/single)
+# ============================================================================
+
+@dataclass
+class PerturbOps:
+    genes_to_keep: Optional[List[Union[int, str]]] = None
+    genes_to_perturb: Optional[List[Union[int, str]]] = None
+    perturb_fraction: Optional[float] = None
+    rank_shift: Optional[str] = None
+    top_k: Optional[int] = None
+    pad_token_id: int = 0
+
+    def _as_set(self, ids: Optional[Iterable[Union[int, str]]]) -> set:
+        return set([] if ids is None else [int(x) for x in ids])
+    
+    def iter_single_tokens(self, input_ids: torch.Tensor) -> Iterable[int]:
+        """Yield only the requested tokens if provided; else all (minus keep)."""
+        keep = self._as_set(self.genes_to_keep)
+        present = set(map(int, torch.unique(input_ids).tolist()))
+
+        if self.genes_to_perturb:
+            requested = self._as_set(self.genes_to_perturb)
+            for t in requested & present:
+                if t not in keep:
+                    yield t
+            return
+
+        # fallback: iterate all present (minus keep)
+        for t in present:
+            if t not in keep:
+                yield t
+
+    def _mask_keep(self, ids: torch.Tensor) -> torch.Tensor:
+        """
+        Boolean mask: True where token is allowed to be perturbed.
+        """
+        keep = self._as_set(self.genes_to_keep)
+        if not keep:
+            return torch.ones_like(ids, dtype=torch.bool)
+        mask = torch.ones_like(ids, dtype=torch.bool)
+        for k in keep:
+            mask = mask & (ids != int(k))
+        return mask
+
+    # --- group mode ---
+    def apply_group(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """
+        Replace a fraction/top_k of tokens (that are not in `genes_to_keep`)
+        with the provided `genes_to_perturb` tokens (cyclic fill).
+        """
+        ids = input_ids.clone()
+        allowed = self._mask_keep(ids)
+        B, L = ids.shape
+        flat = ids[allowed]
+        n = flat.numel()
+        if n == 0:
+            return ids
+        # how many to perturb
+        k = n
+        if self.top_k is not None:
+            k = min(k, int(self.top_k))
+        if self.perturb_fraction is not None:
+            k = min(k, max(1, int(math.ceil(self.perturb_fraction * n))))
+        # choose first k positions deterministically (stable)
+        idx = torch.nonzero(allowed, as_tuple=False).view(-1, 2)[:k]
+        tok_list = [int(t) for t in (self.genes_to_perturb or [])]
+        if not tok_list:
+            return ids
+        fill = torch.as_tensor([tok_list[i % len(tok_list)] for i in range(k)], device=ids.device, dtype=ids.dtype)
+        ids[idx[:, 0], idx[:, 1]] = fill
+        return ids
+
+    # --- single mode ---
+    def iter_single_tokens(self, input_ids: torch.Tensor) -> Iterable[int]:
+        """
+        Iterate distinct tokens (excluding keep set) present in the batch.
+        """
+        keep = self._as_set(self.genes_to_keep)
+        toks = torch.unique(input_ids).tolist()
+        for t in toks:
+            if int(t) not in keep:
+                yield int(t)
+
+    def apply_single(self, input_ids: torch.Tensor, gene_tok: int) -> torch.Tensor:
+        """Replace occurrences of `gene_tok` with PAD if rank_shift == 'delete'."""
+        ids = input_ids.clone()
+        if self.rank_shift == "delete":
+            return torch.where(
+                ids == int(gene_tok),
+                torch.as_tensor(self.pad_token_id, device=ids.device, dtype=ids.dtype),
+                ids,
+            )
+        return ids
+
+
+def validate_gene_token_mapping(ens2tok: dict) -> dict:
+    """
+    Normalize and validate a gene->token dict. Returns cleaned dict.
+    Logs collisions and suspicious entries (non-int tokens).
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+    cleaned = {}
+    bad = 0
+    for k, v in ens2tok.items():
+        ks = str(k)
+        try:
+            vi = int(v)
+        except Exception:
+            bad += 1
+            continue
+        cleaned[ks] = vi
+    if bad:
+        logger.warning("Dropped %d entries with non-integer token IDs.", bad)
+
+    # collision check (token->multiple ensembl)
+    rev = {}
+    col = 0
+    for e, t in cleaned.items():
+        if t in rev and rev[t] != e:
+            col += 1
+        else:
+            rev[t] = e
+    if col:
+        logger.warning("Detected %d token->ensembl collisions (keeping first occurrence).", col)
+    return cleaned
+
+# Delete tokens at indices in example["perturb_index"]
+def delete_indices(example: dict) -> dict:
+    idxs = example.get("perturb_index", [])
+    if not idxs or idxs == [-100]:
+        return example
+    ids = example["input_ids"]
+    keep = [tok for i, tok in enumerate(ids) if i not in idxs]
+    example["input_ids"] = keep
+    example["length"] = len(keep)
+    return example
+
+# Move tokens_to_perturb to the front, preserving order, clip overflow to max_len
+def overexpress_tokens(example: dict, max_len: int) -> dict:
+    ids = example["input_ids"]
+    toks = example.get("tokens_to_perturb", [])
+    front = [t for t in toks if t in ids]
+    tail = [t for t in ids if t not in front]
+    new = (front + tail)[:max_len]
+    example["input_ids"] = new
+    example["length"] = len(new)
+    return example
+
+def calc_n_overflow(max_len: int, length: int, tokens_to_perturb: list, indices_to_perturb: list) -> int:
+    # how many items would be pushed off the end when overexpressing
+    present = sum(1 for i in indices_to_perturb if i is not None)
+    added = present
+    overflow = max(0, (length + added) - max_len)
+    return int(overflow)
+
+def truncate_by_n_overflow(example: dict) -> dict:
+    n = int(example.get("n_overflow", 0))
+    if n <= 0:
+        return example
+    ids = example["input_ids"]
+    example["input_ids"] = ids[:-n]
+    example["length"] = len(example["input_ids"])
+    return example
+
+
+def remove_perturbed_indices_set(full_original_emb: torch.Tensor,
+                                 perturb_type: str,
+                                 indices_to_perturb: list,
+                                 tokens_to_perturb: list,
+                                 lengths: list) -> torch.Tensor:
+    if perturb_type == "overexpress":
+        # remove the front len(tokens_to_perturb) positions later (handled in caller)
+        return full_original_emb
+    # delete: drop perturbed positions
+    slices = []
+    for b, idxs in enumerate(indices_to_perturb):
+        if not idxs or idxs == [-100]:
+            slices.append(full_original_emb[b, :lengths[b], :])
+        else:
+            keep = [j for j in range(lengths[b]) if j not in set(idxs)]
+            slices.append(full_original_emb[b, keep, :])
+    # pad to max length in batch
+    maxL = max(s.shape[0] for s in slices)
+    out = []
+    for s in slices:
+        L = s.shape[0]
+        if L < maxL:
+            pad = torch.zeros((maxL - L, s.shape[1]), device=s.device, dtype=s.dtype)
+            s = torch.cat([s, pad], dim=0)
+        out.append(s.unsqueeze(0))
+    return torch.cat(out, dim=0)
+
+def compute_nonpadded_cell_embedding(full_emb: torch.Tensor, style: str = "mean_pool") -> torch.Tensor:
+    # full_emb: [B, L, H]; mean over non-padding positions (caller must pass lengths if needed)
+    # Here we rely on caller to already cut padding; otherwise use your lengths tensor with mean_nonpadding_embs.
+    return full_emb.mean(dim=1)
+
+
+def remove_indices_per_example(hid: torch.Tensor,
+                               lengths: torch.Tensor,
+                               indices_per_ex: list[list[int]]) -> torch.Tensor:
+    """
+    Remove a (possibly different) list of indices per example from a [B, L, D] tensor.
+    Keeps order of the remaining tokens.
+    """
+    B, L, D = hid.shape
+    kept_rows = []
+    device = hid.device
+    for b in range(B):
+        idxs = sorted(set(int(i) for i in indices_per_ex[b] if i is not None))
+        keep = [i for i in range(int(lengths[b])) if i not in idxs]
+        # if empty, keep a single pad-like zero row to avoid empty tensors
+        if len(keep) == 0:
+            kept_rows.append(torch.zeros(1, D, device=device, dtype=hid.dtype))
+        else:
+            kept_rows.append(hid[b, keep, :])
+    # pad to max length among rows
+    maxL = max(row.shape[0] for row in kept_rows)
+    out = []
+    for row in kept_rows:
+        if row.shape[0] < maxL:
+            pad = torch.zeros(maxL - row.shape[0], D, device=device, dtype=hid.dtype)
+            row = torch.cat([row, pad], dim=0)
+        out.append(row.unsqueeze(0))
+    return torch.cat(out, dim=0)
+
+# ============================================================================
+# IO helpers
+# ============================================================================
+
+def write_cosine_sim_dict(cos_sims: Dict[Tuple[Union[int, Tuple[int, ...]], str], List[float]], out_dir: str, prefix: str) -> str:
+    """
+    Write a nested dict as newline-delimited JSON for easy reload.
+    """
+    out_path = str(Path(out_dir, f"{prefix}_cosine_sims.jsonl"))
+    with open(out_path, "w") as f:
+        for (tok, metric), vals in cos_sims.items():
+            rec = {"key": [tok if not isinstance(tok, tuple) else list(tok), metric], "values": list(map(float, vals))}
+            f.write(json.dumps(rec) + "\n")
+    return out_path
+
+def read_cosine_sims(path):
+    with open(path,'rb') as f:
+        return pickle.load(f)
+
+
+
+def gene_sims_to_dict(input_ids: torch.Tensor,
+                      sims_tokenwise: torch.Tensor,
+                      pad_token_id: int) -> Dict[Tuple[int, str], List[float]]:
+    """
+    Aggregate token-wise similarities into dict entries keyed as (token_id, 'gene_emb').
+    input_ids: [B, L] int tensor
+    sims_tokenwise: [B, L] float tensor
+    """
+    out: Dict[Tuple[int, str], List[float]] = {}
+    ids_np = input_ids.detach().cpu().numpy()
+    sims_np = sims_tokenwise.detach().cpu().numpy()
+    B, L = ids_np.shape
+    for b in range(B):
+        for t in range(L):
+            tok = int(ids_np[b, t])
+            if tok == pad_token_id:
+                continue
+            out.setdefault((tok, "gene_emb"), []).append(float(sims_np[b, t]))
+    return out
+
+import torch
+
+
+
+def remove_indices_per_example(full_emb: torch.Tensor,
+                               lengths: torch.Tensor,
+                               indices_to_remove: List[List[int]]) -> torch.Tensor:
+    """
+    Remove specified indices per example from a [B, L, H] tensor and repad to the
+    max remaining length within the batch. Keeps device/dtype.
+    """
+    device, dtype = full_emb.device, full_emb.dtype
+    B, L, H = full_emb.shape
+    slices = []
+    maxL = 1
+    for b in range(B):
+        keep = [j for j in range(int(lengths[b])) if j not in set(indices_to_remove[b])]
+        if not keep:  # degenerate, keep at least a zero row
+            s = torch.zeros((1, H), device=device, dtype=dtype)
+        else:
+            s = full_emb[b, keep, :]
+        maxL = max(maxL, s.shape[0])
+        slices.append(s)
+    out = []
+    for s in slices:
+        pad_len = maxL - s.shape[0]
+        if pad_len > 0:
+            pad = torch.zeros((pad_len, H), device=device, dtype=dtype)
+            s = torch.cat([s, pad], dim=0)
+        out.append(s.unsqueeze(0))
+    return torch.cat(out, dim=0)  # [B, maxL, H]
 
 
 def write_perturbation_dictionary(cos_sims_dict: defaultdict, output_path_prefix: str):
     with open(f"{output_path_prefix}_raw.pickle", "wb") as fp:
         pickle.dump(cos_sims_dict, fp)
 
+# ====================================
+#       Extended Model Support
+# ====================================
+def nonpad_len_1d(ids_row: list[int], pad_token_id: int) -> int:
+    # count until first pad (assumes right padding)
+    for i, t in enumerate(ids_row):
+        if int(t) == pad_token_id:
+            return i
+    return len(ids_row)
 
-def tensor_list_to_pd(tensor_list):
-    tensor = torch.cat(tensor_list).cpu().numpy()
-    df = pd.DataFrame(tensor)
-    return df
+def overexpress_tokens_extended(example, half_size: int, model_input_size: int):
+    """
+    Insert example['tokens_to_perturb'] at the FRONT of BOTH halves.
+    Set:
+      - example['input_ids'] new concatenated list
+      - example['length']
+      - example['n_overflow_halves'] = [k_spot, k_neigh]
+    """
+    pad = example.get("pad_token_id", None)  # optional if you carry pad id in example
+    tokens = example["tokens_to_perturb"]
+    ids = example["input_ids"]
 
+    spot_ids  = ids[:half_size]
+    neigh_ids = ids[half_size:]
 
-def validate_cell_states_to_model(cell_states_to_model):
-    if cell_states_to_model is not None:
-        if len(cell_states_to_model.items()) == 1:
-            logger.warning(
-                "The single value dictionary for cell_states_to_model will be "
-                "replaced with a dictionary with named keys for start, goal, and alternate states. "
-                "Please specify state_key, start_state, goal_state, and alt_states "
-                "in the cell_states_to_model dictionary for future use. "
-                "For example, cell_states_to_model={"
-                "'state_key': 'disease', "
-                "'start_state': 'dcm', "
-                "'goal_state': 'nf', "
-                "'alt_states': ['hcm', 'other1', 'other2']}"
-            )
-            for key, value in cell_states_to_model.items():
-                if (len(value) == 3) and isinstance(value, tuple):
-                    if (
-                        isinstance(value[0], list)
-                        and isinstance(value[1], list)
-                        and isinstance(value[2], list)
-                    ):
-                        if len(value[0]) == 1 and len(value[1]) == 1:
-                            all_values = value[0] + value[1] + value[2]
-                            if len(all_values) == len(set(all_values)):
-                                continue
-            # reformat to the new named key format
-            state_values = flatten_list(list(cell_states_to_model.values()))
+    # compute non-pad lengths for each half (fallback if pad unknown: assume no pad)
+    if pad is None:
+        Ls = min(len(spot_ids),  half_size)
+        Ln = min(len(neigh_ids), half_size)
+    else:
+        Ls = nonpad_len_1d(spot_ids,  pad)
+        Ln = nonpad_len_1d(neigh_ids, pad)
 
-            cell_states_to_model = {
-                "state_key": list(cell_states_to_model.keys())[0],
-                "start_state": state_values[0][0],
-                "goal_state": state_values[1][0],
-                "alt_states": state_values[2:][0],
-            }
-        elif set(cell_states_to_model.keys()).issuperset(
-            {"state_key", "start_state", "goal_state"}
-        ):
-            if (
-                (cell_states_to_model["state_key"] is None)
-                or (cell_states_to_model["start_state"] is None)
-                or (cell_states_to_model["goal_state"] is None)
-            ):
-                logger.error(
-                    "Please specify 'state_key', 'start_state', and 'goal_state' in cell_states_to_model."
-                )
-                raise
+    # how many tokens can we insert per half without exceeding half_size
+    ins_spot  = min(len(tokens), max(0, half_size - Ls))
+    ins_neigh = min(len(tokens), max(0, half_size - Ln))
 
-            if (
-                cell_states_to_model["start_state"]
-                == cell_states_to_model["goal_state"]
-            ):
-                logger.error("All states must be unique.")
-                raise
+    # overflow for each half (how many pre-existing tokens we must truncate off the end)
+    k_spot  = max(0, len(tokens) - ins_spot)
+    k_neigh = max(0, len(tokens) - ins_neigh)
 
-            if "alt_states" in set(cell_states_to_model.keys()):
-                if cell_states_to_model["alt_states"] is not None:
-                    if not isinstance(cell_states_to_model["alt_states"], list):
-                        logger.error(
-                            "cell_states_to_model['alt_states'] must be a list (even if it is one element)."
-                        )
-                        raise
-                    if len(cell_states_to_model["alt_states"]) != len(
-                        set(cell_states_to_model["alt_states"])
-                    ):
-                        logger.error("All states must be unique.")
-                        raise
-            else:
-                cell_states_to_model["alt_states"] = []
+    # build new halves: [tokens[:ins_*]] + original[:half_size - ins_*]
+    new_spot  = list(tokens[:ins_spot])  + spot_ids[:half_size - ins_spot]
+    new_neigh = list(tokens[:ins_neigh]) + neigh_ids[:half_size - ins_neigh]
 
-        else:
-            logger.error(
-                "cell_states_to_model must only have the following four keys: "
-                "'state_key', 'start_state', 'goal_state', 'alt_states'."
-                "For example, cell_states_to_model={"
-                "'state_key': 'disease', "
-                "'start_state': 'dcm', "
-                "'goal_state': 'nf', "
-                "'alt_states': ['hcm', 'other1', 'other2']}"
-            )
-            raise
+    # concat halves back
+    new_ids = new_spot + new_neigh
+    example["input_ids"] = new_ids[:model_input_size]
+    example["length"] = min(model_input_size, (ins_spot + min(Ls, half_size - ins_spot)) +
+                                          (ins_neigh + min(Ln, half_size - ins_neigh)))
+    example["n_overflow_halves"] = [int(k_spot), int(k_neigh)]
+    return example
 
-class GeneIdHandler:
-    def __init__(
-            self, 
-            raise_errors=False,
-            token_dictionary_file = None,
-            gene_id_name_dict = None):
-        
-        def invert_dict(dict_obj):
-            return {v:k for k,v in dict_obj.items()}
-        
-        self.raise_errors = raise_errors
-        
-        with open(token_dictionary_file, 'rb') as f:
-            self.gene_token_dict = pickle.load(f)
-            self.token_gene_dict = invert_dict(self.gene_token_dict)
+def truncate_by_n_overflow_extended(example, half_size: int):
+    """
+    Truncate ORIGINAL example to remove overflow at the END of each half:
+    remove k_spot from end of first half and k_neigh from end of second half.
+    """
+    ids = example["input_ids"]
+    k_spot, k_neigh = example.get("n_overflow_halves", [0, 0])
+    # first half
+    spot_ids  = ids[:half_size]
+    neigh_ids = ids[half_size:]
+    if k_spot > 0:
+        spot_ids = spot_ids[:-k_spot] if k_spot < len(spot_ids) else []
+    if k_neigh > 0:
+        neigh_ids = neigh_ids[:-k_neigh] if k_neigh < len(neigh_ids) else []
+    example["input_ids"] = spot_ids + neigh_ids
+    example["length"] = len(spot_ids) + len(neigh_ids)
+    return example
 
-        with open(gene_id_name_dict, 'rb') as f:
-            self.gene_id_dict = pickle.load(f)
-            self.id_gene_dict = invert_dict(self.id_gene_dict)
-            
-    def ens_to_token(self, ens_id):
-        if not self.raise_errors:
-            return self.gene_token_dict.get(ens_id, ens_id)
-        else:
-            return self.gene_token_dict[ens_id]
-    
-    def token_to_ens(self, token):
-        if not self.raise_errors:
-            return self.token_gene_dict.get(token, token)
-        else:
-            return self.token_gene_dict[token]
+def remove_front_per_example_halves(hid: torch.Tensor,
+                                    k_spot_vec: torch.Tensor,
+                                    k_neig_vec: torch.Tensor,
+                                    half_size: int) -> torch.Tensor:
+    """
+    Drop first k_spot tokens in first half, and first k_neig tokens in second half.
+    """
+    B, L, D = hid.shape
+    device = hid.device
+    rows, maxL = [], 1
+    for b in range(B):
+        k1 = int(k_spot_vec[b].item())
+        k2 = int(k_neig_vec[b].item())
+        # slice halves
+        h1 = hid[b, :half_size, :]
+        h2 = hid[b, half_size:, :]
+        h1 = h1[k1:, :]
+        h2 = h2[k2:, :]
+        row = torch.cat([h1, h2], dim=0)   # [L' , D]
+        maxL = max(maxL, row.shape[0])
+        rows.append(row)
+    out = []
+    for row in rows:
+        if row.shape[0] < maxL:
+            pad = torch.zeros(maxL - row.shape[0], row.shape[1], device=device, dtype=hid.dtype)
+            row = torch.cat([row, pad], dim=0)
+        out.append(row.unsqueeze(0))
+    return torch.cat(out, dim=0)
 
-    def ens_to_symbol(self, ens_id):
-        if not self.raise_errors:
-            return self.gene_id_dict.get(ens_id, ens_id)
-        else:
-            return self.gene_id_dict[ens_id]
-    
-    def symbol_to_ens(self, symbol):
-        if not self.raise_errors:
-            return self.id_gene_dict.get(symbol, symbol)
-        else:
-            return self.id_gene_dict[symbol]
-    
-    def token_to_symbol(self, token):
-        return self.ens_to_symbol(self.token_to_ens(token))
-    
-    def symbol_to_token(self, symbol):
-        return self.ens_to_token(self.symbol_to_ens(symbol))
+def remove_front_per_example_halves_2d(ids: torch.Tensor,
+                                       k_spot_vec: torch.Tensor,
+                                       k_neig_vec: torch.Tensor,
+                                       half_size: int) -> torch.Tensor:
+    """
+    Same as above for 2D int token ids.
+    """
+    B, L = ids.shape
+    device = ids.device
+    rows, maxL = [], 1
+    for b in range(B):
+        k1 = int(k_spot_vec[b].item()); k2 = int(k_neig_vec[b].item())
+        i1 = ids[b, :half_size]
+        i2 = ids[b, half_size:]
+        i1 = i1[k1:]
+        i2 = i2[k2:]
+        row = torch.cat([i1, i2], dim=0)
+        maxL = max(maxL, row.shape[0])
+        rows.append(row)
+    out = []
+    for row in rows:
+        if row.shape[0] < maxL:
+            pad = torch.zeros(maxL - row.shape[0], device=device, dtype=ids.dtype)
+            row = torch.cat([row, pad], dim=0)
+        out.append(row.unsqueeze(0))
+    return torch.cat(out, dim=0)
