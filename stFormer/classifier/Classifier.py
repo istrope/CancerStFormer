@@ -45,7 +45,7 @@ def build_custom_tokenizer(token_dict_path: str,
     )
     return tokenizer
 
-class GenericClassifier:
+class Classifier:
     """
     A flexible classification utility for Hugging Face tokenized datasets.
 
@@ -84,7 +84,7 @@ class GenericClassifier:
     def __init__(
         self,
         metadata_column,
-        model_mode: str = 'spot',            # "spot" or "extended"
+        mode: str = 'spot',            # "spot" or "extended"
         classifier_type: str = 'sequence',
         gene_class_dict=None,
         label_mapping=None,
@@ -100,7 +100,7 @@ class GenericClassifier:
         nproc: int = 4,
     ):
         self.metadata_column = metadata_column
-        self.model_mode = model_mode
+        self.mode = mode
         self.classifier_type = classifier_type
         self.gene_class_dict = gene_class_dict
         self.label_mapping = label_mapping or {}
@@ -122,15 +122,14 @@ class GenericClassifier:
         """
         Prepare dataset: filter, downsample, map metadata to 'label'/'labels', and save.
 
-        - For sequence classification: creates a single 'label' per example.
         - For gene (token) classification:
             * In 'spot' mode: supervise all tokens.
             * In 'extended' mode: mask tokens after the midpoint of each sequence (len//2) via -100.
-            (Midpoint masking is implemented inside cu.label_classes based on self.model_mode.)
+            (Midpoint masking is implemented inside cu.label_classes based on self.mode.)
         Returns:
             tuple(str, str): Paths to saved dataset and label mapping.
         """
-        data = cu.load_and_filter(self.filter_data, self.nproc, input_data_file)
+        data = cu.load_and_filter(self.filter_data, self.nproc, input_data)
         os.makedirs(output_directory, exist_ok=True)
 
         # Will fill this below and persist to disk
@@ -165,7 +164,7 @@ class GenericClassifier:
                 class_dict=self.gene_class_dict,
                 token_dict_path=self.token_dictionary_file,
                 nproc=self.nproc,
-                model_mode=self.model_mode,   # <-- key change: wires in midpoint masking when 'extended'
+                mode=self.mode,   # <-- key change: wires in midpoint masking when 'extended'
             )
             self.label_mapping = label_map
 

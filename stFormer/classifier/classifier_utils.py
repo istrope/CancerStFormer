@@ -9,7 +9,7 @@ import logging
 import random
 from collections import defaultdict, Counter
 import os
-from typing import Dict,Tuple
+from typing import Dict,Tuple,Union
 import pickle
 from datasets import Dataset,DatasetDict,load_from_disk
 import torch
@@ -21,10 +21,7 @@ def load_and_filter(filter_data, nproc, input_data_file):
     """
     Load a dataset and apply filtering criteria.
     """
-    if isinstance(input_data,str):
-        data = load_from_disk(input_data)
-    else: #already HF dataset
-        data = input_data
+    data = load_from_disk(input_data_file)
     if filter_data:
         for key, values in filter_data.items():
             data = data.filter(lambda ex: ex[key] in values, num_proc=nproc)
@@ -101,41 +98,64 @@ def _filter_over_splits(ds, fn, num_proc=1):
     return ds.filter(fn, num_proc=num_proc)
 
 
+def _ensure_dataset(data: Union[Dataset, DatasetDict]) -> Union[Dataset, DatasetDict]:
+    if isinstance(data, (Dataset, DatasetDict)):
+        return data
+    raise TypeError("data must be a datasets.Dataset or DatasetDict")
+
+def _map_over_splits(data, fn, **kwargs):
+    if isinstance(data, DatasetDict):
+        return DatasetDict({k: v.map(fn, **kwargs) for k, v in data.items()})
+    return data.map(fn, **kwargs)
+
+def _filter_over_splits(data, fn, **kwargs):
+    if isinstance(data, DatasetDict):
+        return DatasetDict({k: v.filter(fn, **kwargs) for k, v in data.items()})
+    return data.filter(fn, **kwargs)
+
 def label_classes(
     classifier: str,
-    data: Dataset | DatasetDict,
+    data: Union[Dataset, DatasetDict],
     class_dict: Dict[str, list] | None,
     token_dict_path: str | None,
     nproc: int,
-    model_mode: str = "spot",   # "spot" or "extended"
-) -> Tuple[Dataset | DatasetDict, Dict[str, int] | None]:
+    model_mode: str = "spot",           # "spot" or "extended"
+    boundary_col: str = "neighbor_boundary",
+) -> Tuple[Union[Dataset, DatasetDict], Dict[str, int] | None]:
     """
     Build label arrays for classification.
 
-    For model_mode == "extended", masks tokens after halfway point in each sequence
-    (len(input_ids) // 2) by setting labels to -100 beyond that index.
+    - classifier == "sequence": labels handled elsewhere (no-op here).
+    - classifier == "gene":
+        * Map tokens -> class IDs using class_dict and token_dict_path.
+        * If model_mode == "extended":
+              For each example, read `boundary_col` (index of neighbor start):
+                - if boundary is None or <0: keep all tokens (spot-only)
+                - else clamp to [0, len(input_ids)] and mask labels at indices >= boundary.
+          If boundary_col is missing, fallback to midpoint (len // 2).
+        * Drop examples with no supervised positions (all -100).
     """
     data = _ensure_dataset(data)
 
     if classifier == "sequence":
-        logger.info("Sequence classification — labels handled in prepare_data()")
+        logger.info("Sequence classification — labels handled in prepare_data(); returning data unchanged.")
         return data, None
     if classifier != "gene":
-        raise ValueError(f"Unknown classifier type: {classifier}")
+        raise ValueError(f"Unknown classifier type: {classifier!r}")
 
     if class_dict is None:
         raise ValueError("class_dict is required for gene classification.")
     if not token_dict_path or not os.path.exists(token_dict_path):
         raise FileNotFoundError(f"token_dict_path not found: {token_dict_path}")
 
-    # Map class names to IDs
+    # class name -> id
     class_id_dict = {name: i for i, name in enumerate(sorted(class_dict.keys()))}
 
-    # Load gene->token dictionary
+    # gene -> token_id
     with open(token_dict_path, "rb") as f:
         gene2token = pickle.load(f)
 
-    # Reverse map: token_id -> class_id
+    # token_id -> class_id
     token2class = {}
     skipped = []
     for cname, genes in class_dict.items():
@@ -147,114 +167,71 @@ def label_classes(
                 continue
             token2class[tid] = cid
     if skipped:
-        logger.warning("Skipped %d genes missing from token dict (showing up to 20): %s",
-                       len(skipped), skipped[:20])
+        logger.warning(
+            "Skipped %d genes missing from token dict (showing up to 20): %s",
+            len(skipped), skipped[:20]
+        )
 
-    # Mapper: assign class IDs and mask after midpoint for extended mode
+    # core mapper
     def _map_gene_labels(batch):
         out_labels = []
-        for ids in batch["input_ids"]:
-            labs = [token2class.get(int(t), -100) for t in ids]
+        ids_list = batch["input_ids"]
+        # boundary column may or may not exist in this split
+        has_boundary = boundary_col in batch
+
+        for i, ids in enumerate(ids_list):
+            # label every token first
+            labs = [ token2class.get(int(t), -100) for t in ids ]
+
             if model_mode == "extended":
-                cutoff = len(labs) // 2
-                labs[cutoff:] = [-100] * (len(labs) - cutoff)
+                # Determine effective cutoff
+                if has_boundary:
+                    raw_nb = batch[boundary_col][i]
+                    try:
+                        nb = int(raw_nb)
+                    except Exception:
+                        nb = -1
+                    if nb is None or nb < 0:
+                        cutoff = len(labs)           # keep all (spot-only)
+                    else:
+                        cutoff = max(0, min(nb, len(labs)))
+                else:
+                    # fallback to midpoint if column not present
+                    cutoff = len(labs) // 2
+
+                # mask neighbor region
+                for j in range(cutoff, len(labs)):
+                    labs[j] = -100
+
             out_labels.append(labs)
+
         batch["labels"] = out_labels
         return batch
-def predict_from_checkpoint(
-    model_dir: str,
-    dataset_path: str,
-    classifier_type: str = "sequence",
-    batch_size: int = 32,
-    num_workers: int = 4,
-    return_logits: bool = False
-):
-    """
-    Load a trained model from `model_dir` and run predictions on a dataset saved at `dataset_path`.
 
-    Args:
-        model_dir (str): Path to the saved model directory.
-        dataset_path (str): Path to the Hugging Face dataset directory.
-        classifier_type (str): 'sequence' or 'token'.
-        batch_size (int): Batch size for prediction.
-        num_workers (int): Number of workers for dataloader.
-        return_logits (bool): If True, return raw logits as well.
+    data = _map_over_splits(data, _map_gene_labels, num_proc=nproc, batched=True, batch_size=1000)
 
-    Returns:
-        Tuple[List[int], Optional[np.ndarray]]: Predicted class indices, optionally logits.
-    """
-    from transformers import (
-    AutoTokenizer,
-    AutoModelForSequenceClassification,
-    AutoModelForTokenClassification,
-    Trainer,
-    TrainingArguments
-    )
-    from datasets import load_from_disk
-    import os
-   
-    try:
-        tokenizer = AutoTokenizer.from_pretrained(model_dir)
-    except:
-        raise ValueError(f'Tokenizer not found in model dir: {model_dir}, try specifying tokenizer path')
-
-    dataset = load_from_disk(dataset_path)
-
-    if classifier_type == 'sequence':
-        model = AutoModelForSequenceClassification.from_pretrained(model_dir)
-        collator = DataCollatorForCellClassification(tokenizer, padding='max_length', max_length=tokenizer.model_max_length)
-        columns = ['input_ids', 'label']
-    else:
-        model = AutoModelForTokenClassification.from_pretrained(model_dir)
-        collator = DataCollatorForGeneClassification(tokenizer, padding='max_length', max_length=tokenizer.model_max_length)
-        columns = ['input_ids', 'labels']
-
-    dataset.set_format(type='torch', columns=columns)
-
-    dummy_args = TrainingArguments(
-        output_dir=os.path.join(model_dir, 'tmp_pred'),
-        per_device_eval_batch_size=batch_size,
-        dataloader_num_workers=num_workers,
-        do_train=False,
-        do_eval=False,
-        logging_dir=os.path.join(model_dir, 'logs')
-    )
-
-    trainer = Trainer(
-        model=model,
-        args=dummy_args,
-        data_collator=collator
-    )
-    
-    predictions = trainer.predict(dataset)
-    predicted_classes = predictions.predictions.argmax(-1)
-
-    if return_logits:
-        return predicted_classes.tolist(), predictions.predictions
-    return predicted_classes.tolist()
-
-    data = _map_over_splits(data, _map_gene_labels, num_proc=nproc, batch_size=1000)
-
-    # Drop examples with no supervised positions
+    # keep only examples with ≥1 supervised token
     def _has_any_supervised(ex):
         return any(l != -100 for l in ex["labels"])
 
     data = _filter_over_splits(data, _has_any_supervised, num_proc=nproc)
 
-    logger.info("Built gene labels (%s mode) for %d classes", model_mode, len(class_id_dict))
+    logger.info("Built gene labels (%s mode) for %d classes; boundary_col=%s",
+                model_mode, len(class_id_dict), boundary_col)
     return data, class_id_dict
 
 class DataCollatorForCellClassification(DataCollatorWithPadding):
-    def __init__(self, tokenizer, padding='max_length', max_length=2048):
-        super().__init__(tokenizer=tokenizer, padding=padding, max_length=max_length)
-
+    """
+    A data collator for cell classification that pads input_ids and collates labels.
+    """
     def __call__(self, features):
-        labels = []
-        for i, f in enumerate(features):
-            lab = f.pop("label")
-            labels.append(lab.item())
-        batch = super().__call__(features)
-        batch["labels"] = torch.tensor(labels, dtype=torch.long)
+        labels = [f["label"] for f in features]
+        input_ids = [f["input_ids"] for f in features]
+        batch = {
+            "input_ids": torch.tensor(input_ids, dtype=torch.long),
+            "labels": torch.tensor(labels, dtype=torch.long)
+        }
+        return batch
 
 _tf_tokenizer_logger = logging.getLogger("transformers.tokenization_utils_base")
 
