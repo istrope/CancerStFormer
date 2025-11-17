@@ -326,17 +326,17 @@ class PerturberStats:
     fdr_alpha: float = 0.05
     min_cells: int = 1
     # dictionaries for mapping
-    gene_token_id_dict: Optional[Dict[str, int]] = None  # ENSEMBL->token
+    token_dictionary_file: Optional[Dict[str, int]] = None  # ENSEMBL->token
     gene_id_name_dict: Optional[Dict[str, str]] = None   # ENSEMBL->symbol
     cell_states_to_model: Optional[dict] = None          # {"state_key":..., "start_state":..., "goal_state":..., "alt_states":[...]}
 
     def _tok_maps(self):
         """Return (tok2name, tok2ens) if dicts provided; else (None, None)."""
-        if not self.gene_token_id_dict or not self.gene_id_name_dict:
+        if not self.token_dictionary_file or not self.gene_id_name_dict:
             return None, None
         tok2name = {}
         tok2ens = {}
-        for ens, tok in self.gene_token_id_dict.items():
+        for ens, tok in self.token_dictionary_file.items():
             try:
                 itok = int(tok)
             except Exception:
@@ -374,30 +374,30 @@ class PerturberStats:
 
     # main entry
     def compute_stats(self,
-                      input_path_or_dir: str,
-                      null_path_or_dir: Optional[str],
-                      output_directory: str,
+                      input_data_dir: str,
+                      null_data_dir: Optional[str],
+                      output_dir: str,
                       output_prefix: str) -> str:
         tok2name, tok2ens = self._tok_maps()
 
-        out_dir = Path(output_directory)
+        out_dir = Path(output_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
 
         if self.mode == "aggregate_data":
-            merged = self._load_and_merge(input_path_or_dir)
+            merged = self._load_and_merge(input_data_dir)
             out_csv = out_dir / f"{output_prefix}_aggregate_data.csv"
             return _mode_aggregate_data(merged, tok2name, out_csv)
 
         if self.mode == "aggregate_gene_shifts":
-            merged = self._load_and_merge(input_path_or_dir)
+            merged = self._load_and_merge(input_data_dir)
             out_csv = out_dir / f"{output_prefix}_aggregate_gene_shifts.csv"
             return _mode_aggregate_gene_shifts(merged, tok2name, out_csv, tok2ens)
 
         if self.mode == "vs_null":
-            if null_path_or_dir is None:
-                raise ValueError("vs_null requires null_path_or_dir")
-            merged_t = self._load_and_merge(input_path_or_dir)
-            merged_n = self._load_and_merge(null_path_or_dir)
+            if null_data_dir is None:
+                raise ValueError("vs_null requires null_data_dir")
+            merged_t = self._load_and_merge(input_data_dir)
+            merged_n = self._load_and_merge(null_data_dir)
             out_csv = out_dir / f"{output_prefix}_vs_null.csv"
             return _mode_vs_null(merged_t, merged_n, tok2name, out_csv)
 
@@ -405,12 +405,12 @@ class PerturberStats:
             if not self.cell_states_to_model:
                 raise ValueError("goal_state_shift requires cell_states_to_model")
             # Expect base_dir containing subdirs per state (names matching the config values)
-            by_state = self._load_by_state(input_path_or_dir)
+            by_state = self._load_by_state(input_data_dir)
             out_csv = out_dir / f"{output_prefix}_goal_state_shift.csv"
             return _mode_goal_state_shift(by_state, self.cell_states_to_model, tok2name, out_csv)
 
         if self.mode == "mixture_model":
-            merged = self._load_and_merge(input_path_or_dir)
+            merged = self._load_and_merge(input_data_dir)
             out_csv = out_dir / f"{output_prefix}_mixture_model.csv"
             return _mode_mixture_model(merged, tok2name, out_csv)
 

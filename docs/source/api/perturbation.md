@@ -1,8 +1,9 @@
 # In-Silico Perturbation
 
-## class: InSilicoPerturber
+
+## class: Perturber
 ```python
-class InSilicoPerturber:
+class Perturber:
     def __init__(
         self,
         mode: str = 'spot',
