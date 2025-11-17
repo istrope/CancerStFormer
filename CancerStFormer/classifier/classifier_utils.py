@@ -9,19 +9,23 @@ import logging
 import random
 from collections import defaultdict, Counter
 import os
-from typing import Dict,Tuple,Union
+from typing import Dict,Tuple,Union,Any,List
 import pickle
 from datasets import Dataset,DatasetDict,load_from_disk
 import torch
-from transformers import DataCollatorWithPadding
-
+from transformers import DataCollatorWithPadding, PreTrainedTokenizerBase
 
 logger = logging.getLogger(__name__)
 def load_and_filter(filter_data, nproc, input_data_file):
     """
     Load a dataset and apply filtering criteria.
     """
-    data = load_from_disk(input_data_file)
+    if os.path.exists(input_data_file):
+        data = load_from_disk(input_data_file)
+    elif type(input_data_file) == Dataset: # don't need to re-load as dataset
+        data = input_data_file
+    else:
+        raise ValueError('Input Data not of type Dataset or file (or file does not exist)')
     if filter_data:
         for key, values in filter_data.items():
             data = data.filter(lambda ex: ex[key] in values, num_proc=nproc)
@@ -119,7 +123,7 @@ def label_classes(
     class_dict: Dict[str, list] | None,
     token_dict_path: str | None,
     nproc: int,
-    model_mode: str = "spot",           # "spot" or "extended"
+    mode: str = "spot",           # "spot" or "extended"
     boundary_col: str = "neighbor_boundary",
 ) -> Tuple[Union[Dataset, DatasetDict], Dict[str, int] | None]:
     """
@@ -128,7 +132,7 @@ def label_classes(
     - classifier == "sequence": labels handled elsewhere (no-op here).
     - classifier == "gene":
         * Map tokens -> class IDs using class_dict and token_dict_path.
-        * If model_mode == "extended":
+        * If mode == "extended":
               For each example, read `boundary_col` (index of neighbor start):
                 - if boundary is None or <0: keep all tokens (spot-only)
                 - else clamp to [0, len(input_ids)] and mask labels at indices >= boundary.
@@ -183,7 +187,7 @@ def label_classes(
             # label every token first
             labs = [ token2class.get(int(t), -100) for t in ids ]
 
-            if model_mode == "extended":
+            if mode == "extended":
                 # Determine effective cutoff
                 if has_boundary:
                     raw_nb = batch[boundary_col][i]
@@ -217,20 +221,41 @@ def label_classes(
     data = _filter_over_splits(data, _has_any_supervised, num_proc=nproc)
 
     logger.info("Built gene labels (%s mode) for %d classes; boundary_col=%s",
-                model_mode, len(class_id_dict), boundary_col)
+                mode, len(class_id_dict), boundary_col)
     return data, class_id_dict
 
-class DataCollatorForCellClassification(DataCollatorWithPadding):
+class DataCollatorForCellClassification:
     """
-    A data collator for cell classification that pads input_ids and collates labels.
+    A padding collator for *sequence* classification.
+    Pads input_ids via tokenizer and collates labels.
     """
-    def __call__(self, features):
+    def __init__(
+        self,
+        tokenizer: PreTrainedTokenizerBase,
+        padding: str = "longest",          # or "max_length"
+        max_length: int | None = None,
+        return_tensors: str = "pt"
+    ):
+        self.tokenizer = tokenizer
+        self.padding = padding
+        self.max_length = max_length
+        self.return_tensors = return_tensors
+
+    def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
         labels = [f["label"] for f in features]
-        input_ids = [f["input_ids"] for f in features]
-        batch = {
-            "input_ids": torch.tensor(input_ids, dtype=torch.long),
-            "labels": torch.tensor(labels, dtype=torch.long)
-        }
+        feats = [{k: v for k, v in f.items() if k == "input_ids"} for f in features]
+
+        prev = _tf_tokenizer_logger.level
+        _tf_tokenizer_logger.setLevel(logging.ERROR)
+        batch = self.tokenizer.pad(
+            feats,
+            padding=self.padding,
+            max_length=self.max_length,
+            return_tensors=self.return_tensors,
+        )
+        _tf_tokenizer_logger.setLevel(prev)
+
+        batch["labels"] = torch.tensor(labels, dtype=torch.long)
         return batch
 
 _tf_tokenizer_logger = logging.getLogger("transformers.tokenization_utils_base")

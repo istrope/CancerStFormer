@@ -36,7 +36,6 @@ def build_custom_tokenizer(token_dict_path: str,
         vocab = pickle.load(f)
     tokenizer = PreTrainedTokenizerFast(
         vocab=vocab,
-        merges = [],
         unk_token="<unk>",
         pad_token="<pad>",
         mask_token="<mask>",
@@ -238,7 +237,7 @@ class Classifier:
                 max_length=tokenizer.model_max_length
             )
             ModelClass = AutoModelForSequenceClassification
-        else: # token classifier
+        else: # gene classifier
             collator = DataCollatorForGeneClassification(
                 tokenizer,
                 padding='max_length',
@@ -290,7 +289,6 @@ class Classifier:
             compute_metrics=eu.compute_metrics,
             data_collator=collator
         )
-        print("Max label:", max(train_ds['label'] if self.classifier_type == 'sequence' else [l for ex in ds['labels'] for l in ex]))
         print("Label mapping size:", len(self.label_mapping))
 
         try:
@@ -402,9 +400,9 @@ class Classifier:
                 vocab_size=len(tokenizer),
                 num_labels=num_labels
             )
-            if self.classifier_type == "token": #gene classification
+            if self.classifier_type == "gene": #gene classification
                 # token classification head
-                config.num_labels = len(self.gene_class_dict)  # or self.num_labels
+                config.num_labels = len(self.gene_class_dict)
                 model = AutoModelForTokenClassification.from_pretrained(
                     model_checkpoint,
                     config=config,
@@ -412,7 +410,7 @@ class Classifier:
                 )
             else:
                 # sequence classification head
-                config.num_labels = len(self.gene_class_dict)
+                config.num_labels =num_labels
                 model = AutoModelForSequenceClassification.from_pretrained(
                     model_checkpoint,
                     config=config,
@@ -427,7 +425,7 @@ class Classifier:
         #  Tokenizer & collator
         tok_src = tokenizer_name_or_path or model_checkpoint
         tokenizer = self._load_tokenizer(tok_src)
-        if self.classifier_type == 'token':
+        if self.classifier_type == 'gene':
             from classifier_utils import DataCollatorForGeneClassification
             collator = DataCollatorForGeneClassification(
                 tokenizer,

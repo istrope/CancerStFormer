@@ -3,7 +3,7 @@
 ## Classifier
 
 ```python
-class GenericClassifier:
+class Classifier:
     def __init__(
         self,
         metadata_column: str,

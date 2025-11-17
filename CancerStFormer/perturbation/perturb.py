@@ -13,7 +13,7 @@ from tqdm import tqdm
 import pickle
 from collections import defaultdict
 
-from perturb_utils import (
+from CancerStFormer.perturbation.perturb_utils import (
     # dataset I/O + filtering
     load_and_filter_dataset as load_and_filter,
     filter_by_metadata as filter_by_dict,
@@ -60,7 +60,7 @@ hf_logging.set_verbosity_error()
 class Config:
     # perturbation setup
     perturb_type: str  # {"group","single"}
-    model_variant: str
+    mode: str
     perturb_rank_shift: Optional[str]
     genes_to_perturb: Optional[List[Union[int, str]]]
     genes_to_keep: Optional[List[Union[int, str]]]
@@ -83,12 +83,12 @@ class Config:
 
     def __post_init__(self) -> None:
         _choice("perturb_type", self.perturb_type, {"group", "single"})
-        _choice('model_variant',self.model_variant,{'spot','extended'})
+        _choice('mode',self.mode,{'spot','extended'})
         _choice("model_type", self.model_type, {"Pretrained", "GeneClassifier", "CellClassifier"})
         _choice("emb_mode", getattr(self, "emb_mode", "cell"), {"cell", "gene", "cell_and_gene"})
-        _ge("num_samples", self.num_samples, 1)
-        _ge("forward_batch_size", self.forward_batch_size, 1)
-        _ge("nproc", self.nproc, 1)
+        _get("num_samples", self.num_samples, 1)
+        _get("forward_batch_size", self.forward_batch_size, 1)
+        _get("nproc", self.nproc, 1)
         if self.perturb_fraction is not None and not (0.0 < float(self.perturb_fraction) <= 1.0):
             raise ValueError("`perturb_fraction` must be in (0, 1].")
         if self.cell_inds_to_perturb is not None:
@@ -110,7 +110,7 @@ def _choice(name: str, value, allowed: set) -> None:
         raise ValueError(f"Invalid `{name}` = {value!r}; allowed: {sorted(allowed)}")
 
 
-def _ge(name: str, value: int, lo: int) -> None:
+def _get(name: str, value: int, lo: int) -> None:
     if int(value) < lo:
         raise ValueError(f"Invalid `{name}` = {value!r}; must be >= {lo}")
 
@@ -125,7 +125,7 @@ class Perturber:
     def __init__(
         self,
         perturb_type,
-        model_variant,
+        mode,
         perturb_rank_shift,
         genes_to_perturb,
         genes_to_keep,
@@ -146,7 +146,7 @@ class Perturber:
     ):
         self.cfg = Config(
             perturb_type=perturb_type,
-            model_variant=model_variant,
+            mode=mode,
             perturb_rank_shift=perturb_rank_shift,
             genes_to_perturb=genes_to_perturb,
             genes_to_keep=genes_to_keep,
@@ -205,7 +205,7 @@ class Perturber:
 
             tokset = set(resolved_perturb)
 
-            if self.cfg.model_variant == 'extended':
+            if self.cfg.mode == 'extended':
                 # keep examples where ALL perturb tokens appear in BOTH halves
                 def _both_halves(example):
                     ids = example["input_ids"]
@@ -214,13 +214,13 @@ class Perturber:
                     return tokset.issubset(first) and tokset.issubset(second)
 
                 ds = ds.filter(_both_halves, num_proc=self.cfg.nproc)
-            elif self.cfg.model_variant == 'spot':
+            elif self.cfg.mode == 'spot':
                 def _has_all(example):
                     ids = set(int(t) for t in example["input_ids"])
                     return tokset.issubset(ids)
                 ds = ds.filter(_has_all, num_proc=self.cfg.nproc)
             else:
-                raise ValueError('Not valid model_variant option, please pick between: spot and extended')
+                raise ValueError('Not valid mode option, please pick between: spot and extended')
 
         if self.cfg.start_state is not None:
             ds = filter_by_start_state(ds, self.cfg.start_state, self.cfg.nproc)
@@ -310,7 +310,7 @@ class Perturber:
         if run_group:
             def _make_group_perturbation_batch(example):
                 ids = example["input_ids"]
-                if self.cfg.model_variant == "extended": # extended model conditions
+                if self.cfg.mode == "extended": # extended model conditions
                     spot_ids    = ids[:half_size]
                     neigh_ids   = ids[half_size:]
                     # indices in EACH half
@@ -349,7 +349,7 @@ class Perturber:
             perturbed_data = ds.map(_make_group_perturbation_batch, num_proc=self.cfg.nproc)
 
             if (self.cfg.perturb_type == "overexpress" or self.cfg.perturb_rank_shift == "overexpress"):
-                if self.cfg.model_variant == "extended":
+                if self.cfg.mode == "extended":
                     # add per-half overflow vector if not present
                     if "n_overflow_halves" not in ds.column_names:
                         ds = ds.add_column("n_overflow_halves", perturbed_data["n_overflow_halves"])
@@ -397,7 +397,7 @@ class Perturber:
                         hid_p_aligned = hid_p
                         ids_for_pairs = batch_p["input_ids"]  # reflects deletions
 
-                    elif (self.cfg.model_variant == "extended" and
+                    elif (self.cfg.mode == "extended" and
                         (self.cfg.perturb_type == "overexpress" or self.cfg.perturb_rank_shift == "overexpress")):
                         # per-example [k_spot, k_neigh] computed at map time
                         k_halves = pb["n_overflow_halves"]  # e.g. [[k_spot, k_neigh], ...]
