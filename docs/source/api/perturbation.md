@@ -1,1122 +1,1304 @@
 # In-Silico Perturbation
 
+This module implements in-silico perturbation for STFormer-style models, including
+dataset filtering, model adapters, perturbation operators, and downstream statistics.
+
+---
 
 ## class: Perturber
+
 ```python
 class Perturber:
     def __init__(
         self,
-        mode: str = 'spot',
-        perturb_type: str = 'delete',
-        perturb_rank_shift: Optional[int] = None,
-        genes_to_perturb: Union[str, List[str]] = 'all',
-        combos: int = 0,
-        anchor_gene: Optional[str] = None,
-        model_type: str = 'Pretrained',
-        num_classes: int = 0,
-        emb_mode: str = 'cell',
-        cell_emb_style: str = 'mean_pool',
-        filter_data: Optional[Dict[str, List[Any]]] = None,
-        cell_states_to_model: Optional[Dict[str, Any]] = None,
-        state_embs_dict: Optional[Dict[str, torch.Tensor]] = None,
-        max_ncells: Optional[int] = None,
-        cell_inds_to_perturb: Union[str, Dict[str, int]] = 'all',
-        emb_layer: int = -1,
-        forward_batch_size: int = 100,
-        nproc: int = 4,
-        token_dictionary_file: str
+        perturb_type,
+        mode,
+        perturb_rank_shift,
+        genes_to_perturb,
+        genes_to_keep,
+        perturb_fraction,
+        num_samples,
+        top_k,
+        model_type,
+        anchor_gene,
+        cell_states_to_model,
+        cell_emb_style,
+        num_classes,
+        start_state,
+        filter_data,
+        emb_layer,
+        emb_mode,
+        forward_batch_size,
+        nproc,
+        token_dictionary_file,
+        cell_inds_to_perturb=None,
+        **kwargs,
     )
-```
+````
 
-Instantiate an in silico perturber to simulate gene-level or cell-level perturbations.
+Instantiate an in-silico perturber to simulate gene-level or cell-level perturbations on
+tokenized spot or extended (spot + neighbor) sequences.
 
 **Parameters**
 
-- **mode** (`str`): Dataset tokenization mode: `'spot'` or `'neighborhood'`.
-- **perturb\_type** (`str`): Perturbation operation: `'delete'`, `'overexpress'`, `'inhibit'`, or `'activate'`.
-- **perturb\_rank\_shift** (`int` or `None`): Rank shift for `'inhibit'`/`'activate'` modes (ignored for delete/overexpress).
-- **genes\_to\_perturb** (`'all'` or `List[str]`): Gene(s) to perturb; `'all'` perturbs entire input.
-- **combos** (`int`): 0 for individual perturbations; 1 for pairwise combinations with `anchor_gene`.
-- **anchor\_gene** (`str` or `None`): ENSEMBL ID for anchor in combination perturbations.
-- **model\_type** (`str`): `'Pretrained'`, `'GeneClassifier'`, or `'CellClassifier'`.
-- **num\_classes** (`int`): Number of classes if using a classifier model; 0 otherwise.
-- **emb\_mode** (`str`): `'cell'` or `'cell_and_gene'`, output embeddings scope.
-- **cell\_emb\_style** (`str`): Pooling method for cell embeddings (currently `'mean_pool'`).
-- **filter\_data** (`dict` or `None`): Column-to-values map to pre-filter dataset.
-- **cell\_states\_to\_model** (`dict` or `None`): Dict with keys `state_key`, `start_state`, `goal_state`, `alt_states` for state modeling.
-- **state\_embs\_dict** (`dict` or `None`): Map from state names to target embeddings (`torch.Tensor`).
-- **max\_ncells** (`int` or `None`): Max number of cells to process.
-- **cell\_inds\_to\_perturb** (`'all'` or `{'start':int,'end':int}`): Slice indices after filtering.
-- **emb\_layer** (`int`): Layer offset for embedding extraction (`-1` for penultimate, `0` for final).
-- **forward\_batch\_size** (`int`): Batch size for forward passes.
-- **nproc** (`int`): CPU processes for data operations.
-- **token\_dictionary\_file** (`str`): Path to pickle mapping gene IDs to token IDs.
+- **perturb_type** (`str`): High-level perturbation mode. Supports
+  group-style operations such as `"group"`, `"single"`, `"delete"`, or `"overexpress"`.
+- **mode** (`str`): Dataset tokenization mode; `"spot"` for single sequences or
+  `"extended"` for concatenated spot/neighbor sequences.
+- **perturb_rank_shift** (`str` or `None`): Rank-shift operation label (e.g. `"delete"`, `"overexpress"`);
+  primarily used to distinguish behaviors for group and single perturbations.
+- **genes_to_perturb** (`list[str | int]` or `None`): Gene identifiers (ENSEMBL IDs or token IDs)
+  to perturb. If `None`, falls back to single-token scan mode.
+- **genes_to_keep** (`list[str | int]` or `None`): Genes that should never be perturbed; all tokens
+  in this set are excluded from perturbation.
+- **perturb_fraction** (`float` or `None`): Fraction of eligible tokens (after `genes_to_keep` filtering)
+  to perturb in group mode. Must lie in `(0, 1]` if provided.
+- **num_samples** (`int`): Maximum number of examples to perturb after filtering; dataset is shuffled
+  and truncated if larger than this value.
+- **top_k** (`int` or `None`): Upper bound on the number of positions to perturb across a batch in group mode.
+- **model_type** (`str`): Type of model to load. One of `"Pretrained"`, `"GeneClassifier"`, or `"CellClassifier"`.
+- **anchor_gene** (`str` or `int` or `None`): Optional anchor identifier (ENSEMBL or token ID); when
+  `genes_to_perturb` is omitted, a valid `anchor_gene` will be used as the sole perturbation target.
+- **cell_states_to_model** (`dict` or `None`): Optional configuration describing start/goal/alternate
+  cell states for downstream statistics; passed to perturbation stats rather than used directly here.
+- **cell_emb_style** (`str`): Strategy to generate cell embeddings from token embeddings; currently
+  `"mean_pool"` is used to average token embeddings over the sequence.
+- **num_classes** (`int`): Number of label classes when `model_type` is a classifier; ignored for
+  `"Pretrained"` models.
+- **start_state** (`dict` or `None`): Optional configuration for restricting the dataset to a specific
+  start cell state (e.g. `{"state_key": "Group", "start_state": "Vehicle"}`).
+- **filter_data** (`dict` or `None`): Column-to-values mapping used to pre-filter the input dataset
+  before any perturbations (e.g. `{"Tissue": ["Brain"]}`).
+- **emb_layer** (`int`): Layer offset (added to the total number of transformer layers) for selecting
+  the representation used in similarity calculations (e.g. `-1` for final hidden layer).
+- **emb_mode** (`str`): Embedding aggregation mode. `"cell"` computes only pooled cell-level similarities;
+  `"gene"` computes token-wise similarities; `"cell_and_gene"` records both.
+- **forward_batch_size** (`int`): Batch size used for forward passes during perturbation.
+- **nproc** (`int`): Number of processes used for dataset filtering and mapping.
+- **token_dictionary_file** (`str`): Path to a pickled mapping of ENSEMBL IDs to token IDs used to
+  resolve `genes_to_perturb`, `genes_to_keep`, and `anchor_gene`.
+- **cell_inds_to_perturb** (`dict` or `None`): Optional slice dictionary of form
+  `{"start": int, "end": int}` used to restrict perturbations to a specific index range after filtering.
+- **kwargs**: Additional legacy keyword arguments are accepted and ignored to preserve backward
+  compatibility with older APIs.
 
-**Returns**
+**Raises**
 
-- Instance of `InSilicoPerturber`.
----
+- **ValueError**: If configuration values are incompatible (e.g. invalid `perturb_type`, negative
+  `num_samples`, or incorrect `cell_inds_to_perturb` bounds).
 
-### perturb_data
+
+### perturb_dataset
+
 ```python
-def perturb_data(
+def perturb_dataset(
     self,
     model_directory: str,
     input_data_file: str,
     output_directory: str,
-    output_prefix: str
-) -> None
+    output_prefix: str,
+) -> str
 ```
 
-Run the full perturbation workflow: load model, filter data, apply perturbs.
+Run the full perturbation workflow: load model, filter and slice the dataset, apply group
+or single perturbations, compute cosine similarity shifts, and write raw results to disk.
 
 **Parameters**
 
-- **model\_directory** (`str`): Path to pretrained or classifier model.
-- **input\_data\_file** (`str`): Path to input HF Dataset.
-- **output\_directory** (`str`): Directory for output files.
-- **output\_prefix** (`str`): Prefix for result filenames.
+- **model_directory** (`str`): Path to a pretrained or classifier model checkpoint directory
+  compatible with Hugging Face `AutoModel` / `AutoModelForSequenceClassification`.
+- **input_data_file** (`str`): Path to a tokenized Hugging Face `Dataset` on disk (as produced
+  by the STFormer tokenization pipeline).
+- **output_directory** (`str`): Directory where raw perturbation similarity pickles will be saved.
+- **output_prefix** (`str`): Prefix for the output filename. The method appends `"_raw.pickle"`.
 
 **Returns**
 
-- `None`
+- **str**: Full path to the raw similarity file (`"{output_directory}/{output_prefix}_raw.pickle"`).
 
----
-### isp_perturb_set
+**Description**
 
-```python
-def isp_perturb_set(
-    self,
-    model: torch.nn.Module,
-    dataset: Dataset,
-    layer_to_quant: int,
-    prefix: str
-) -> None
-```
+1. Loads the requested model on CPU or GPU using `load_model_to_device`.
+2. Determines the effective embedding layer index via `ModelAdapter.quant_layers()` and `emb_layer`.
+3. Loads and filters the dataset with `load_and_filter_dataset`, including optional start-state,
+   token-based, and index range filters.
+4. Resolves ENSEMBL IDs to token IDs based on `token_dictionary_file` for `genes_to_perturb` and
+   `genes_to_keep`, and configures a `PerturbOps` instance.
+5. In **group mode** (when explicit perturbation targets are supplied), creates a perturbed dataset
+   via HF `Dataset.map`, applies delete or overexpression operations (`delete_indices`,
+   `overexpress_tokens`, `overexpress_tokens_extended`), and aligns original vs. perturbed sequences
+   for token-wise cosine similarity using `quant_cos_sims_tokenwise`.
+6. In **single mode**, iterates over distinct tokens present in each batch and deletes each token
+   individually, computing cell-level cosine shifts for each target.
+7. Aggregates all similarity scores in a `defaultdict` keyed by `(perturbed_token, "cell_emb")`
+   and `(perturbed_token, affected_token)` (for gene-level sims), then writes the dictionary using
+   `write_perturbation_dictionary`.
 
-Perform group perturbations on the dataset and compute cosine similarities.
-
-**Parameters**
-
-- **model** (`nn.Module`): Model with `output_hidden_states=True`.
-- **dataset** (`Dataset`): Filtered input dataset.
-- **layer\_to\_quant** (`int`): Layer index offset for embeddings.
-- **prefix** (`str`): Filename prefix for saving results.
-
-**Returns**
-
-- `None`
-
----
-### isp_perturb_all
-```python
-def isp_perturb_all(
-    self,
-    model: torch.nn.Module,
-    dataset: Dataset,
-    layer_to_quant: int,
-    prefix: str
-) -> None
-```
-
-Perturb each cell individually, compute embeddings, and save results in batches.
-
-**Parameters**
-
-- **model** (`nn.Module`): Model for embedding extraction.
-- **dataset** (`Dataset`): Filtered input dataset.
-- **layer\_to\_quant** (`int`): Layer index offset.
-- **prefix** (`str`): Filename prefix for batch outputs.
-
-**Returns**
-
-- `None`
 
 ---
 
+## Core Dataset & Model Utilities (`perturb_utils.py`)
 
-## Perturb Utility Functions
+### load_and_filter_dataset
 
-### validate_options
 ```python
-def validate_options(self) -> None
-```
-
-Validate constructor options for type, compatibility, and development status.
-
-**Parameters**
-
-- **self**: Perturber instance.
-
-**Raises**
-
-- **ValueError**: On invalid or incompatible options.
-
----
-
-### apply_additional_filters
-```python
-def apply_additional_filters(
-    self,
-    filtered_input_data: Dataset
-) -> Dataset
-```
-
-Apply state-based, token-based, downsampling, and slicing filters.
-
-**Parameters**
-
-- **filtered\_input\_data** (`Dataset`): Dataset after initial metadata filters.
-
-**Returns**
-
-- **Dataset**: Further filtered, sorted, and sliced dataset.
-
----
-
-### update_perturbation_dictionary
-```python
-def update_perturbation_dictionary(
-    self,
-    cos_sims: defaultdict,
-    sims: torch.Tensor,
-    _data: Any,
-    _indices: Any,
-    genes: Optional[List[int]] = None
-) -> defaultdict
-```
-
-Append cosine similarity values to a results dictionary.
-
-**Parameters**
-
-- **cos\_sims** (`defaultdict`): Accumulator mapping keys to lists of similarity values.
-- **sims** (`torch.Tensor`): Similarity scores tensor.
-- **\_data** (`Any`): Unused; for signature compatibility.
-- **\_indices** (`Any`): Unused; for signature compatibility.
-- **genes** (`List[int]` or `None`): Token IDs of genes corresponding to `sims` rows.
-
-**Returns**
-
-- **defaultdict**: Updated similarity accumulator.
-
----
-### load_and_filter
-```python
-def load_and_filter(
-    filter_data: Optional[Dict[str, List[Any]]],
+def load_and_filter_dataset(
+    filter_data: Optional[dict],
     nproc: int,
     input_data_file: str
 ) -> Dataset
 ```
 
-Load a Hugging Face dataset and apply metadata filters.
+Load a Hugging Face `Dataset` from disk and apply optional metadata filtering.
 
 **Parameters**
 
-* **filter\_data** (`Optional[Dict[str, List[Any]]]`): Metadata filters (column names to allowed values). If `None`, no filtering.
-* **nproc** (`int`): Number of parallel processes for filtering.
-* **input\_data\_file** (`str`): Path to a saved HF Dataset directory.
+- **filter_data** (`dict` or `None`): Mapping from column names to allowed values; if `None`, no
+  filters are applied.
+- **nproc** (`int`): Number of processes to use for filtering.
+- **input_data_file** (`str`): Directory path of a saved HF `Dataset` (as from `datasets.load_from_disk`).
 
 **Returns**
 
-* **Dataset**: Filtered dataset.
+- **Dataset**: Filtered dataset.
 
----
 
-### filter_by_dict
+### filter_by_metadata
+
 ```python
-def filter_by_dict(
+def filter_by_metadata(
     data: Dataset,
-    filter_data: Dict[str, List[Any]],
+    filter_data: dict,
     nproc: int
 ) -> Dataset
 ```
 
-Retain only examples matching specified metadata criteria.
+Retain only examples whose metadata columns match specified values.
 
 **Parameters**
 
-* **data** (`Dataset`): Input dataset.
-* **filter\_data** (`Dict[str, List[Any]]`): Mapping from metadata column to allowed values.
-* **nproc** (`int`): Number of workers.
+- **data** (`Dataset`): Input dataset containing metadata columns.
+- **filter_data** (`dict`): Mapping from column name to allowed values (scalar or list).
+- **nproc** (`int`): Number of workers for parallel filtering.
 
 **Returns**
 
-* **Dataset**: Filtered dataset.
+- **Dataset**: Subset of `data` containing only rows that satisfy all filter criteria.
 
----
-### filter_data_by_tokens
+**Raises**
+
+- **ValueError**: If no rows remain after filtering.
+
+
+### filter_by_start_state
+
 ```python
-def filter_data_by_tokens(
-    filtered_input_data: Dataset,
-    tokens: Sequence[int],
+def filter_by_start_state(
+    data: Dataset,
+    state_dict: dict,
     nproc: int
 ) -> Dataset
 ```
 
-Keep examples containing all specified token IDs in their `input_ids`.
+Filter the dataset to examples that belong to specific start states.
 
 **Parameters**
 
-* **filtered\_input\_data** (`Dataset`): Dataset with `input_ids` lists.
-* **tokens** (`Sequence[int]`): Token IDs required.
-* **nproc** (`int`): Number of processes.
+- **data** (`Dataset`): Input dataset.
+- **state_dict** (`dict`): Contains at least `"state_key"` and one or more desired state values
+  (e.g. `{"state_key": "Group", "start_state": "Vehicle"}`).
+- **nproc** (`int`): Number of processes for filtering.
 
 **Returns**
 
-* **Dataset**: Subset containing required tokens.
+- **Dataset**: Filtered dataset restricted to the specified start-state values.
 
----
-### filter_data_by_tokens_and_log
+
+### slice_by_indices_to_perturb
+
 ```python
-def filter_data_by_tokens_and_log(
-    filtered_input_data: Dataset,
-    tokens: Sequence[int],
-    nproc: int,
-    filtered_tokens_categ: str
+def slice_by_indices_to_perturb(
+    data: Dataset,
+    inds: dict
 ) -> Dataset
 ```
 
-Filter by tokens and log the remaining count, raising an error if none remain.
+Return a contiguous slice of the dataset based on `start` and `end` indices.
 
 **Parameters**
 
-* **filtered\_input\_data** (`Dataset`): Dataset before token filtering.
-* **tokens** (`Sequence[int]`): Token IDs to require.
-* **nproc** (`int`): Number of workers.
-* **filtered\_tokens\_categ** (`str`): Description for logging.
+- **data** (`Dataset`): Input dataset after other filters.
+- **inds** (`dict`): Dictionary with `"start"` and `"end"` keys specifying the inclusive start
+  and exclusive end indices of the slice.
 
 **Returns**
 
-* **Dataset**: Filtered dataset.
+- **Dataset**: Sliced dataset from `start` to `end` (clamped to dataset length).
 
----
-### filter_data_by_start_state
-```python
-def filter_data_by_start_state(
-    filtered_input_data: Dataset,
-    cell_states_to_model: Dict[str, Any],
-    nproc: int
-) -> Dataset
-```
+**Raises**
 
-Restrict data to a specified starting state.
+- **ValueError**: If the slice range is invalid (negative start, end ≤ start, or start beyond length).
 
-**Parameters**
 
-* **filtered\_input\_data** (`Dataset`): Pre-filtered dataset.
-* **cell\_states\_to\_model** (`Dict[str, Any]`): Must include:
-
-  * `state_key` (`str`): Metadata column name.
-  * `start_state` (`Any`): Desired value in that column.
-* **nproc** (`int`): Number of processes.
-
-**Returns**
-
-* **Dataset**: Subset matching the start state.
-
----
-### slice_by_inds_to_perturb
-```python
-def slice_by_inds_to_perturb(
-    dataset: Dataset,
-    inds: Dict[str, int]
-) -> Dataset
-```
-
-Select a contiguous slice of examples by start/end indices.
-
-**Parameters**
-
-* **dataset** (`Dataset`): Input dataset.
-* **inds** (`Dict[str, int]`): Contains `start` (inclusive) and `end` (exclusive) indices.
-
-**Returns**
-
-* **Dataset**: Sliced dataset.
-
----
-### load_model
-```python
-def load_model(
-    model_type: str,
-    num_classes: int,
-    model_directory: str,
-    mode: str
-) -> nn.Module
-```
-
-Load a transformer model for evaluation or classification.
-
-**Parameters**
-
-* **model\_type** (`str`): `'Pretrained'`, `'GeneClassifier'`, or `'CellClassifier'`.
-* **num\_classes** (`int`): Number of labels (for classifier types).
-* **model\_directory** (`str`): Path or HF model ID.
-* **mode** (`str`): `'eval'` to enable hidden states, else `'train'`.
-
-**Returns**
-
-* **nn.Module**: Loaded model on CUDA with appropriate config.
-
----
-### quant_layers
-```python
-def quant_layers(
-    model: nn.Module
-) -> int
-```
-
-Count transformer encoder layers in the model.
-
-**Parameters**
-
-* **model** (`nn.Module`): Transformer model.
-
-**Returns**
-
-* **int**: Number of layers.
-
----
-
-### get_model_emb_dims
-```python
-def get_model_emb_dims(
-    model: nn.Module
-) -> int
-```
-
-Get the hidden size (embedding dimension) of the model.
-
-**Parameters**
-
-* **model** (`nn.Module`): Transformer model.
-
-**Returns**
-
-* **int**: Size of embeddings.
-
----
-### get_model_input_size
-```python
-def get_model_input_size(
-    model: nn.Module
-) -> int
-```
-
-Retrieve the maximum sequence length of the model.
-
-**Parameters**
-
-* **model** (`nn.Module`): Transformer model.
-
-**Returns**
-
-* **int**: Max position embeddings.
-
----
-### measure_length
-```python
-def measure_length(
-    example: Dict[str, Any]
-) -> Dict[str, Any]
-```
-
-Compute and set the `length` field for an example.
-
-**Parameters**
-
-* **example** (`Dict[str, Any]`): Must include `input_ids`.
-
-**Returns**
-
-* **Dict\[str, Any]**: Example with updated `length`.
-
----
 ### downsample_and_sort
+
 ```python
 def downsample_and_sort(
     data: Dataset,
-    max_ncells: Optional[int]
+    max_ncells: int
 ) -> Dataset
 ```
 
-Randomly downsample up to `max_ncells` and sort by sequence length.
+Downsample to at most `max_ncells` examples while preserving original order.
 
 **Parameters**
 
-* **data** (`Dataset`): Input dataset.
-* **max\_ncells** (`Optional[int]`): Max examples; if `None`, no downsampling.
+- **data** (`Dataset`): Input dataset.
+- **max_ncells** (`int` or `None`): Maximum number of examples to retain. If `None` or if
+  `len(data) <= max_ncells`, the dataset is returned unchanged.
 
 **Returns**
 
-* **Dataset**: Downsampled, length-sorted dataset.
+- **Dataset**: Possibly truncated dataset.
 
----
-### stratified_downsample_and_sort
+
+### load_model_to_device
+
 ```python
-def stratified_downsample_and_sort(
-    data: Dataset,
-    max_ncells: int,
-    stratify_by: str
-) -> Dataset
+def load_model_to_device(
+    model_type: str,
+    num_classes: int,
+    model_directory: str,
+    mode: str = "eval"
+)
 ```
 
-Perform stratified sampling to reach `max_ncells`, then sort by length.
+Load a model from a checkpoint directory and move it to CPU or GPU.
 
 **Parameters**
 
-* **data** (`Dataset`): Dataset with grouping column.
-* **max\_ncells** (`int`): Target total samples.
-* **stratify\_by** (`str`): Column for stratification.
+- **model_type** (`str`): `"Pretrained"` to load `AutoModel`, `"GeneClassifier"` or `"CellClassifier"`
+  to load `AutoModelForSequenceClassification` with `num_labels=num_classes`.
+- **num_classes** (`int`): Number of labels for classification heads; ignored if `model_type="Pretrained"`.
+- **model_directory** (`str`): Path to the model checkpoint directory.
+- **mode** (`str`): `"eval"` to set the model in evaluation mode; other values leave training mode.
 
 **Returns**
 
-* **Dataset**: Stratified, downsampled, sorted dataset.
+- **nn.Module**: Loaded Hugging Face model with `output_hidden_states=True`.
 
----
-### forward_pass_single_cell
+
+### quant_layers
+
 ```python
-def forward_pass_single_cell(
-    model: nn.Module,
-    example_cell: Dict[str, Any],
-    layer_to_quant: int
+def quant_layers(model) -> int
+```
+
+Infer the number of transformer layers in a model for negative indexing.
+
+**Parameters**
+
+- **model**: Hugging Face model instance.
+
+**Returns**
+
+- **int**: Number of hidden layers (e.g. 12 for BERT-base), used to compute layer offsets.
+
+
+### get_model_hidden_size
+
+```python
+def get_model_hidden_size(model) -> int
+```
+
+Return the hidden size (embedding dimension) from the model configuration.
+
+**Parameters**
+
+- **model**: Hugging Face model instance.
+
+**Returns**
+
+- **int**: Hidden size (e.g. 768).
+
+**Raises**
+
+- **AttributeError**: If the hidden size cannot be determined from the config.
+
+
+### get_model_input_size
+
+```python
+def get_model_input_size(model) -> int
+```
+
+Determine the maximum input sequence length for a model.
+
+**Parameters**
+
+- **model**: Hugging Face model instance.
+
+**Returns**
+
+- **int**: Maximum sequence length, derived from `max_position_embeddings` or defaulting to `512`.
+
+
+### quant_cos_sims_tokenwise
+
+```python
+def quant_cos_sims_tokenwise(
+    hid_orig: torch.Tensor,
+    hid_pert: torch.Tensor
 ) -> torch.Tensor
 ```
 
-Extract embeddings for a single example.
+Compute token-wise cosine similarities between original and perturbed hidden states.
 
 **Parameters**
 
-* **model** (`nn.Module`): Model with `output_hidden_states=True`.
-* **example\_cell** (`Dict[str, Any]`): Must include `input_ids` and `attention_mask`.
-* **layer\_to\_quant** (`int`): Index of layer to return.
+- **hid_orig** (`torch.Tensor`): Original hidden states with shape `[B, L, H]`.
+- **hid_pert** (`torch.Tensor`): Perturbed hidden states with the same shape.
 
 **Returns**
 
-* **torch.Tensor**: Embedding tensor.
+- **torch.Tensor**: Cosine similarities for each token `[B, L]`.
 
----
-### delete_indices
+
+### quant_cos_sims
+
 ```python
-def delete_indices(
-    example: Dict[str, Any]
-) -> Dict[str, Any]
-```
-
-Remove tokens specified in `example['perturb_index']`.
-
-**Parameters**
-
-* **example** (`Dict[str, Any]`): Contains `input_ids` and `perturb_index`.
-
-**Returns**
-
-* **Dict\[str, Any]**: Example with tokens removed and updated `length`.
-
----
-### overexpress_indices
-```python
-def overexpress_indices(
-    example: Dict[str, Any]
-) -> Dict[str, Any]
-```
-
-Simulate overexpression by duplicating tokens in `perturb_index`.
-
-**Parameters**
-
-* **example** (`Dict[str, Any]`): Contains `input_ids` and `perturb_index`.
-
-**Returns**
-
-* **Dict\[str, Any]**: Example with tokens rearranged and updated `length`.
-
----
-### make_perturbation_batch
-```python
-def make_perturbation_batch(
-    example_cell: Dict[str, Any],
-    perturb_type: str,
-    tokens_to_perturb: Union[str, List[int]],
-    anchor_token: Any,
-    combo_lvl: int,
-    num_proc: int
-) -> Tuple[Dataset, List[List[int]]]
-```
-
-Generate a dataset of perturbed examples and corresponding perturbation indices.
-
-**Parameters**
-
-* **example\_cell** (`Dict[str, Any]`): Single-example batch with `input_ids` and `length`.
-* **perturb\_type** (`str`): `'delete'` or `'overexpress'`.
-* **tokens\_to\_perturb** (`str` or `List[int]`): Token IDs or `'all'`.
-* **anchor\_token** (`Any`): Anchor ID for combo perturbations.
-* **combo\_lvl** (`int`): Combination level (0=single, >0=group).
-* **num\_proc** (`int`): Processes for mapping.
-
-**Returns**
-
-* **Dataset**: Perturbation examples.
-* **List\[List\[int]]**: Indices used for each perturbation.
-
----
-### make_comparison_batch
-```python
-def make_comparison_batch(
-    original_emb_batch: torch.Tensor,
-    indices_to_perturb: List[List[int]],
-    perturb_group: bool
+def quant_cos_sims(
+    A: torch.Tensor,
+    B: torch.Tensor,
+    cell_states_to_model=None,
+    state_embs_dict=None,
+    emb_mode: str = "gene"
 ) -> torch.Tensor
 ```
 
-Create aligned batches for comparing original and perturbed embeddings.
+Compute cosine similarities between embeddings at either gene or cell level.
 
 **Parameters**
 
-* **original\_emb\_batch** (`torch.Tensor`): Batch of original embeddings.
-* **indices\_to\_perturb** (`List[List[int]]`): Token indices removed/added.
-* **perturb\_group** (`bool`): Group perturb across multiple cells.
+- **A** (`torch.Tensor`): First embedding tensor. `[B, L, H]` for `"gene"` mode or `[B, H]` for `"cell"` mode.
+- **B** (`torch.Tensor`): Second embedding tensor with matching shape.
+- **cell_states_to_model** (`dict` or `None`): Reserved for state-aware comparisons (not used directly here).
+- **state_embs_dict** (`dict` or `None`): Optional state embedding dictionary (not used directly here).
+- **emb_mode** (`str`): `"gene"` for per-token similarities or `"cell"` for per-cell similarities.
 
 **Returns**
 
-* **torch.Tensor**: Embeddings aligned for comparison.
+- **torch.Tensor**: `[B, L]` in gene mode or `[B]` in cell mode.
 
----
+
+### remove_front_per_example
+
+```python
+def remove_front_per_example(
+    hid: torch.Tensor,
+    k_vec: torch.Tensor
+) -> torch.Tensor
+```
+
+Remove a variable number of tokens from the front of each example and pad to a common length.
+
+**Parameters**
+
+- **hid** (`torch.Tensor`): Hidden states of shape `[B, L, H]`.
+- **k_vec** (`torch.Tensor`): Per-example counts of tokens to remove from the front; shape `[B]`.
+
+**Returns**
+
+- **torch.Tensor**: New tensor `[B, L', H]` where `L'` is the maximum remaining length in the batch.
+
+
+### remove_front_per_example_2d
+
+```python
+def remove_front_per_example_2d(
+    ids: torch.Tensor,
+    k_vec: torch.Tensor
+) -> torch.Tensor
+```
+
+Remove a variable number of token IDs from the front of each sequence and pad to a common length.
+
+**Parameters**
+
+- **ids** (`torch.Tensor`): Token IDs of shape `[B, L]`.
+- **k_vec** (`torch.Tensor`): Per-example counts of tokens to drop from the front; shape `[B]`.
+
+**Returns**
+
+- **torch.Tensor**: New token ID tensor `[B, L']` with padding appended as zeros.
+
+
 ### pad_tensor_list
+
 ```python
 def pad_tensor_list(
-    tensor_list: List[torch.Tensor],
-    dynamic_or_constant: Union[str, int],
-    pad_token_id: float,
+    tensors: List[torch.Tensor],
+    max_len: int,
+    pad_token_id: int,
     model_input_size: int,
-    dim: Optional[int] = None,
-    padding_func: Callable = pad_2d_tensor
+    dim_to_pad: int = 1,
+    pad_fn=None,
 ) -> torch.Tensor
 ```
 
-Pad a list of tensors to a common length.
+Pad a list of tensors along the sequence dimension and stack them into a batch.
 
 **Parameters**
 
-* **tensor\_list** (`List[torch.Tensor]`): Tensors to pad.
-* **dynamic\_or\_constant** (`str` or `int`): `'dynamic'` or fixed length.
-* **pad\_token\_id** (`float`): Value for padding.
-* **model\_input\_size** (`int`): Default max length.
-* **dim** (`int`, optional): Dimension to pad.
-* **padding\_func** (`Callable`): Specific pad function.
+- **tensors** (`List[torch.Tensor]`): List of 1D or 2D tensors containing token IDs or embeddings.
+- **max_len** (`int`): Maximum length to pad/truncate to in this batch.
+- **pad_token_id** (`int`): Token ID used for padding `input_ids`.
+- **model_input_size** (`int`): Global maximum model input size (used by custom pad functions).
+- **dim_to_pad** (`int`): Dimension index corresponding to sequence length (default `1`).
+- **pad_fn** (callable or `None`): Custom padding function; if `None`, a simple right-padding scheme is used.
 
 **Returns**
 
-* **torch.Tensor**: Stacked tensor batch.
+- **torch.Tensor**: Stacked padded tensor batch.
 
----
+
+### pad_3d_tensor
+
+```python
+def pad_3d_tensor(
+    tensors: List[torch.Tensor],
+    max_len: int,
+    pad_token_id: int,
+    model_input_size: int,
+    dim_to_pad: int = 1,
+) -> torch.Tensor
+```
+
+Pad a list of 2D or 3D tensors to a common length and stack into a 3D batch tensor.
+
+**Parameters**
+
+- **tensors** (`List[torch.Tensor]`): Each element is `[L, H]` or `[B, L, H]`.
+- **max_len** (`int`): Target sequence length.
+- **pad_token_id** (`int`): Unused for embedding tensors; kept for API compatibility.
+- **model_input_size** (`int`): Global maximum model input size (unused here).
+- **dim_to_pad** (`int`): Sequence dimension index (unused; assumed `1`).
+
+**Returns**
+
+- **torch.Tensor**: Concatenated tensor of shape `[B, max_len, H]`.
+
+
 ### gen_attention_mask
+
 ```python
 def gen_attention_mask(
-    minibatch_encoding: Dict[str, List[int]],
-    max_len: Optional[int] = None
+    batch: Dataset
 ) -> torch.Tensor
 ```
 
-Generate attention masks from example lengths.
+Build an attention mask from a dataset batch that has `length` and `input_ids` fields.
 
 **Parameters**
 
-* **minibatch\_encoding** (`Dict[str, List[int]]`): Contains `length` list.
-* **max\_len** (`Optional[int]`): Override maximum length.
+- **batch** (`Dataset`): Mini-batch from a HF `Dataset` containing `length` for each example.
 
 **Returns**
 
-* **torch.Tensor**: Attention mask tensor.
+- **torch.Tensor**: Attention mask of shape `[batch_size, max_len]` filled with ones.
 
----
+
+### gen_attention_mask_from_lengths
+
+```python
+def gen_attention_mask_from_lengths(
+    lengths: int,
+    batch_size: int
+) -> torch.Tensor
+```
+
+Generate an all-ones attention mask given a maximum length and batch size.
+
+**Parameters**
+
+- **lengths** (`int`): Maximum sequence length for the current batch.
+- **batch_size** (`int`): Number of examples.
+
+**Returns**
+
+- **torch.Tensor**: Mask tensor of ones with shape `[batch_size, lengths]`.
+
+
 ### mean_nonpadding_embs
+
 ```python
 def mean_nonpadding_embs(
     embs: torch.Tensor,
-    original_lens: torch.Tensor,
-    dim: int = 1
+    lengths: torch.Tensor
 ) -> torch.Tensor
 ```
 
-Compute mean embeddings excluding padded positions.
+Mean-pool embeddings over non-padded positions in each sequence.
 
 **Parameters**
 
-* **embs** (`torch.Tensor`): Embedding batch.
-* **original\_lens** (`torch.Tensor`): True lengths per example.
-* **dim** (`int`): Dimension of sequence.
+- **embs** (`torch.Tensor`): Embedding tensor of shape `[B, L, H]`.
+- **lengths** (`torch.Tensor`): True sequence lengths for each example; shape `[B]`.
 
 **Returns**
 
-* **torch.Tensor**: Mean pooled embeddings.
+- **torch.Tensor**: Mean-pooled embeddings `[B, H]`.
 
----
-### quant_cos_sims
+
+### class: BatchMaker
+
 ```python
-def quant_cos_sims(
-    perturbation_emb: torch.Tensor,
-    original_emb: torch.Tensor,
-    cell_states_to_model: Optional[Dict[str, Any]] = None,
-    state_embs_dict: Optional[Dict[str, torch.Tensor]] = None,
-    emb_mode: str = 'gene'
-) -> Union[torch.Tensor, Dict[str, torch.Tensor]]
+@dataclass
+class BatchMaker:
+    pad_token_id: int
+    model_input_size: int
+    batch_size: int = 64
+
+    def iter(
+        self,
+        data: Dataset,
+        with_indices: bool = False,
+        progress_desc: Optional[str] = None
+    )
 ```
 
-Compute cosine similarity shifts between perturbed and original embeddings.
+Create padded mini-batches from a sorted HF `Dataset` for model forward passes.
+
+**Parameters (init)**
+
+- **pad_token_id** (`int`): Padding token ID.
+- **model_input_size** (`int`): Maximum model sequence length.
+- **batch_size** (`int`): Number of examples per batch.
+
+**Methods**
+
+- **iter(data, with_indices=False, progress_desc=None)**: Iterate over the dataset in contiguous
+  slices, returning dictionaries with `input_ids`, `attention_mask`, and `lengths` tensors.
+
+**Returns (iter)**
+
+- **Iterator[dict]**: Each item is a batch dictionary compatible with `ModelAdapter.forward`.
+
+
+### class: ModelAdapter
+
+```python
+class ModelAdapter:
+    @staticmethod
+    def get_pad_token_id(model) -> int
+
+    @staticmethod
+    def get_model_input_size(model) -> int
+
+    @staticmethod
+    def quant_layers(model) -> int
+
+    @staticmethod
+    def forward(model, batch: Dict[str, torch.Tensor])
+
+    @staticmethod
+    def pick_layer(outputs, layer_index: int) -> torch.Tensor
+
+    @staticmethod
+    def pool_mean(
+        embs: torch.Tensor,
+        lengths: torch.Tensor,
+        exclude_cls: bool = False,
+        exclude_eos: bool = False
+    ) -> torch.Tensor
+```
+
+Lightweight adapter to standardize model interaction (device placement, layer selection,
+and pooling) across different Hugging Face architectures.
+
+**Methods**
+
+- **get_pad_token_id(model)**: Return the padding token ID from model config (default `0`).
+- **get_model_input_size(model)**: Proxy to `get_model_input_size` utility.
+- **quant_layers(model)**: Proxy to `quant_layers` utility.
+- **forward(model, batch)**: Move `input_ids` and `attention_mask` to the model device and
+  call the model with `output_hidden_states=True`.
+- **pick_layer(outputs, layer_index)**: Extract the hidden state tensor at the given layer index.
+- **pool_mean(embs, lengths, exclude_cls=False, exclude_eos=False)**: Mean-pool over token
+  embeddings, optionally excluding CLS and/or final EOS positions.
+
+
+### class: PerturbOps
+
+```python
+@dataclass
+class PerturbOps:
+    genes_to_keep: Optional[List[Union[int, str]]] = None
+    genes_to_perturb: Optional[List[Union[int, str]]] = None
+    perturb_fraction: Optional[float] = None
+    rank_shift: Optional[str] = None
+    top_k: Optional[int] = None
+    pad_token_id: int = 0
+```
+
+Utility class encapsulating group and single-token perturbation rules.
+
+**Parameters (init)**
+
+- **genes_to_keep** (`list[int | str]` or `None`): Genes that must not be perturbed.
+- **genes_to_perturb** (`list[int | str]` or `None`): Explicit perturbation targets; if `None` in
+  single mode, all non-keep tokens are candidates.
+- **perturb_fraction** (`float` or `None`): Fraction of eligible token positions to perturb in group mode.
+- **rank_shift** (`str` or `None`): Perturbation operation label (e.g. `"delete"`).
+- **top_k** (`int` or `None`): Maximum number of positions to perturb in group mode.
+- **pad_token_id** (`int`): Padding ID used for deletions when `rank_shift == "delete"`.
+
+**Methods**
+
+- **iter_single_tokens(input_ids)**: Yield distinct tokens in the batch that should be perturbed
+  (excluding `genes_to_keep` and restricted to `genes_to_perturb` if provided).
+- **_mask_keep(ids)**: Internal helper to build a boolean mask of perturbable positions.
+- **apply_group(input_ids)**: Replace a subset of non-keep positions with `genes_to_perturb` in a
+  deterministic order, respecting `top_k` and `perturb_fraction`.
+- **apply_single(input_ids, gene_tok)**: Apply a per-token perturbation (currently delete by setting
+  `pad_token_id` when `rank_shift == "delete"`).
+
+
+### validate_gene_token_mapping
+
+```python
+def validate_gene_token_mapping(ens2tok: dict) -> dict
+```
+
+Normalize and validate a gene→token dictionary loaded from pickle.
 
 **Parameters**
 
-* **perturbation\_emb** (`torch.Tensor`): Perturbed embeddings.
-* **original\_emb** (`torch.Tensor`): Original embeddings.
-* **cell\_states\_to\_model** (`Optional[Dict]`): Dict with state comparison info.
-* **state\_embs\_dict** (`Optional[Dict]`): Embeddings for target states.
-* **emb\_mode** (`str`): `'gene'` or `'cell'` mode.
+- **ens2tok** (`dict`): Raw mapping of gene IDs to token IDs.
 
 **Returns**
 
-* **torch.Tensor**: Cosine similarities for `'gene'` mode.
-* **Dict\[str, torch.Tensor]**: Shift maps for `'cell'` mode.
+- **dict**: Cleaned mapping with string keys and integer token IDs; entries with non-integer token IDs
+  are dropped and token collisions are logged.
 
----
+
+### delete_indices
+
+```python
+def delete_indices(example: dict) -> dict
+```
+
+Delete tokens at positions in `example["perturb_index"]` and update sequence length.
+
+**Parameters**
+
+- **example** (`dict`): Contains `input_ids` and `perturb_index` list.
+
+**Returns**
+
+- **dict**: Modified example with updated `input_ids` and `length`.
+
+
+### overexpress_tokens
+
+```python
+def overexpress_tokens(
+    example: dict,
+    max_len: int
+) -> dict
+```
+
+Simulate overexpression by moving selected tokens to the front of a sequence.
+
+**Parameters**
+
+- **example** (`dict`): Contains `input_ids` and `tokens_to_perturb`.
+- **max_len** (`int`): Maximum length to retain after reordering.
+
+**Returns**
+
+- **dict**: Example with tokens rearranged (overexpressed tokens at front) and updated `length`.
+
+
+### calc_n_overflow
+
+```python
+def calc_n_overflow(
+    max_len: int,
+    length: int,
+    tokens_to_perturb: list,
+    indices_to_perturb: list
+) -> int
+```
+
+Compute how many tokens will overflow (be pushed off the end) after overexpression.
+
+**Parameters**
+
+- **max_len** (`int`): Maximum sequence length.
+- **length** (`int`): Original sequence length.
+- **tokens_to_perturb** (`list`): Tokens being overexpressed.
+- **indices_to_perturb** (`list`): Original positions of perturbed tokens.
+
+**Returns**
+
+- **int**: Number of tokens that would overflow past `max_len`.
+
+
+### truncate_by_n_overflow
+
+```python
+def truncate_by_n_overflow(example: dict) -> dict
+```
+
+If `example["n_overflow"] > 0`, drop that many tokens from the end of `input_ids`.
+
+**Parameters**
+
+- **example** (`dict`): Contains `input_ids`, `length`, and `n_overflow`.
+
+**Returns**
+
+- **dict**: Example with truncated `input_ids` and updated `length`.
+
+
+### remove_perturbed_indices_set
+
+```python
+def remove_perturbed_indices_set(
+    full_original_emb: torch.Tensor,
+    perturb_type: str,
+    indices_to_perturb: list,
+    tokens_to_perturb: list,
+    lengths: list
+) -> torch.Tensor
+```
+
+Remove perturbed positions from original embeddings for alignment with perturbed sequences.
+
+**Parameters**
+
+- **full_original_emb** (`torch.Tensor`): Original embeddings `[B, L, H]`.
+- **perturb_type** (`str`): Perturbation operation type (`"delete"` or `"overexpress"`).
+- **indices_to_perturb** (`list[list[int]]`): Indices per example that were perturbed.
+- **tokens_to_perturb** (`list`): Tokens affected (used for overexpression semantics).
+- **lengths** (`list[int]`): Original sequence lengths.
+
+**Returns**
+
+- **torch.Tensor**: Embeddings with perturbed positions removed and padded to equal length.
+
+
+### compute_nonpadded_cell_embedding
+
+```python
+def compute_nonpadded_cell_embedding(
+    full_emb: torch.Tensor,
+    style: str = "mean_pool"
+) -> torch.Tensor
+```
+
+Compute a cell-level embedding given a token-level embedding tensor with padding already removed.
+
+**Parameters**
+
+- **full_emb** (`torch.Tensor`): Embedding tensor `[B, L, H]` without padding tokens.
+- **style** (`str`): Pooling style; `"mean_pool"` computes mean over the sequence dimension.
+
+**Returns**
+
+- **torch.Tensor**: Cell embeddings `[B, H]`.
+
+
+### remove_indices_per_example
+
+```python
+def remove_indices_per_example(
+    full_emb: torch.Tensor,
+    lengths: torch.Tensor,
+    indices_to_remove: List[List[int]]
+) -> torch.Tensor
+```
+
+Remove specified token positions per example from a `[B, L, H]` tensor and repad rows.
+
+**Parameters**
+
+- **full_emb** (`torch.Tensor`): Input embeddings `[B, L, H]`.
+- **lengths** (`torch.Tensor`): True lengths per example `[B]`.
+- **indices_to_remove** (`List[List[int]]`): List of index lists; one per example.
+
+**Returns**
+
+- **torch.Tensor**: A new tensor `[B, L', H]` with removed positions and zero-padding as needed.
+
+
+### write_cosine_sim_dict
+
+```python
+def write_cosine_sim_dict(
+    cos_sims: Dict[Tuple[Union[int, Tuple[int, ...]], str], List[float]],
+    out_dir: str,
+    prefix: str
+) -> str
+```
+
+Write a cosine similarity dictionary as newline-delimited JSON for inspection or reuse.
+
+**Parameters**
+
+- **cos_sims** (`dict`): Mapping from `(token or token tuple, metric)` to list of similarity values.
+- **out_dir** (`str`): Output directory.
+- **prefix** (`str`): Filename prefix.
+
+**Returns**
+
+- **str**: Path to the written JSONL file.
+
+
+### read_cosine_sims
+
+```python
+def read_cosine_sims(path)
+```
+
+Load a pickled cosine similarity dictionary from disk.
+
+**Parameters**
+
+- **path** (`str`): Path to a pickle file created by perturbation routines.
+
+**Returns**
+
+- **dict**: Loaded similarity dictionary.
+
+
+### gene_sims_to_dict
+
+```python
+def gene_sims_to_dict(
+    input_ids: torch.Tensor,
+    sims_tokenwise: torch.Tensor,
+    pad_token_id: int
+) -> Dict[Tuple[int, str], List[float]]
+```
+
+Aggregate token-wise similarities into a gene-level dictionary keyed by token ID.
+
+**Parameters**
+
+- **input_ids** (`torch.Tensor`): Token IDs `[B, L]`.
+- **sims_tokenwise** (`torch.Tensor`): Similarities `[B, L]`.
+- **pad_token_id** (`int`): Token ID treated as padding (ignored).
+
+**Returns**
+
+- **dict**: Mapping `(token_id, "gene_emb") → list[float]` of similarity values.
+
+
 ### write_perturbation_dictionary
+
 ```python
 def write_perturbation_dictionary(
     cos_sims_dict: defaultdict,
     output_path_prefix: str
-) -> None
+)
 ```
 
-Save raw cosine similarity results to a pickle.
+Save the perturbation cosine similarity dictionary as a pickle.
 
 **Parameters**
 
-* **cos\_sims\_dict** (`defaultdict`): Similarity accumulator.
-* **output\_path\_prefix** (`str`): Prefix for output file.
+- **cos_sims_dict** (`defaultdict`): Raw similarity accumulator.
+- **output_path_prefix** (`str`): Prefix for the output file; `"_raw.pickle"` is appended.
 
 **Returns**
 
-* `None`
+- `None`
 
----
-### GeneIdHandler
-```python
-class GeneIdHandler:
-    def __init__(
-        self,
-        raise_errors: bool = False,
-        token_dictionary_file: str,
-        gene_id_name_dict: str
-    )
-```
 
-Utility to convert between ENSEMBL IDs, tokens, and gene symbols.
+### Extended model support
 
-**Parameters**
+The following helpers are used to support extended models where sequences are split
+into two halves (e.g. spot vs neighbor) and overexpression is applied to both halves.
 
-* **raise\_errors** (`bool`): If `True`, missing keys raise KeyError; else return input.
-* **token\_dictionary\_file** (`str`): Path to pickle mapping gene→token.
-* **gene\_id\_name\_dict** (`str`): Path to pickle mapping gene ID→symbol.
-
-**Methods**
-
-* **ens\_to\_token(ens\_id)**: Map ENSEMBL to token ID.
-* **token\_to\_ens(token)**: Reverse map.
-* **ens\_to\_symbol(ens\_id)**: Map ENSEMBL to gene symbol.
-* **symbol\_to\_ens(symbol)**: Reverse map.
-* **token\_to\_symbol(token)**: Token → symbol.
-* **symbol\_to\_token(symbol)**: Symbol → token.
-
-**Returns**
-
-* Instance of `GeneIdHandler`.
-
-## Perturb Stats
-
-### Class: InSilicoPerturberStats
+#### nonpad_len_1d
 
 ```python
-class InSilicoPerturberStats:
-    def __init__(
-        self,
-        mode: str = 'mixture_model',
-        genes_perturbed: Union[str, List[Any]] = 'all',
-        combos: int = 0,
-        anchor_gene: Optional[str] = None,
-        cell_states_to_model: Optional[Dict[str, Any]] = None,
-        pickle_suffix: str = '_raw.pickle',
-        token_dictionary_file: str | None = None,
-        gene_name_id_dictionary_file: str | None = None
-    )
+def nonpad_len_1d(ids_row: list[int], pad_token_id: int) -> int
 ```
 
-Configure the type of perturbation statistics to compute and load necessary mappings.
+Count non-padding tokens in a single sequence.
 
-**Parameters**
+- **ids_row** (`list[int]`): Token IDs (possibly padded).
+- **pad_token_id** (`int`): Padding token ID.
 
-* **mode** (`str`): One of `{'goal_state_shift','vs_null','mixture_model','aggregate_data','aggregate_gene_shifts'}`.
-* **genes\_perturbed** (`'all'` or `List[Any]`): Genes to evaluate.
-* **combos** (`int`): Combination level (0=single, 1=pairwise, 2=triplet).
-* **anchor\_gene** (`str`, optional): ENSEMBL ID for anchor gene in combos.
-* **cell\_states\_to\_model** (`Dict[str, Any]`, optional): Dict with keys `'state_key','start_state','goal_state','alt_states'`.
-* **pickle\_suffix** (`str`): Suffix to identify raw pickle files.
-* **token\_dictionary\_file** (`str`, optional): Path to token→ID pickle.
-* **gene\_name\_id\_dictionary\_file** (`str`, optional): Path to gene symbol→ID pickle.
+Returns the index of the first pad token or the full length if no padding is found.
+
+
+#### overexpress_tokens_extended
 
 ```python
-    def validate_options(self) -> None
+def overexpress_tokens_extended(
+    example,
+    half_size: int,
+    model_input_size: int
+)
 ```
 
-Validate initialization parameters and enforce compatibility.
+Insert `example["tokens_to_perturb"]` at the front of both spot and neighbor halves,
+tracking overflow per half.
 
-**Raises**
+- **example** (`dict`): Contains `input_ids`, optional `pad_token_id`, and `tokens_to_perturb`.
+- **half_size** (`int`): Number of positions allocated to each half.
+- **model_input_size** (`int`): Global maximum sequence length.
 
-* **ValueError**: On invalid or incompatible options.
+Updates `example["input_ids"]`, `example["length"]`, and `example["n_overflow_halves"]`.
+
+
+#### truncate_by_n_overflow_extended
 
 ```python
-    def get_stats(
-        self,
-        input_data_directory: str,
-        null_dist_data_directory: Optional[str],
-        output_directory: str,
-        output_prefix: str,
-        null_dict_list: Optional[List[Dict[Any, Any]]] = None
-    ) -> None
+def truncate_by_n_overflow_extended(
+    example,
+    half_size: int
+)
 ```
 
-Compute chosen statistics and write results to CSV.
+Truncate the original sequence to remove overflow positions at the end of each half.
 
-**Parameters**
+- **example** (`dict`): Contains `input_ids` and `n_overflow_halves`.
+- **half_size** (`int`): Half-length used to split the sequence.
 
-* **input\_data\_directory** (`str`): Directory of raw pickle inputs.
-* **null\_dist\_data\_directory** (`str`, optional): Directory of null distribution pickles.
-* **output\_directory** (`str`): Output directory for CSV.
-* **output\_prefix** (`str`): Prefix for CSV filename.
-* **null\_dict\_list** (`List[Dict]`, optional): Preloaded null dictionaries.
+Returns the modified example with updated `input_ids` and `length`.
+
+
+#### remove_front_per_example_halves
 
 ```python
-    def token_to_gene_name(self, item: Union[int, Tuple[int, ...]]) -> Union[str, Tuple[str, ...]]
+def remove_front_per_example_halves(
+    hid: torch.Tensor,
+    k_spot_vec: torch.Tensor,
+    k_neig_vec: torch.Tensor,
+    half_size: int
+) -> torch.Tensor
 ```
 
-Map a token ID or tuple of IDs to gene symbol(s).
+Drop `k_spot_vec[b]` tokens from the front of the first half and `k_neig_vec[b]` tokens from
+the front of the second half for each example.
 
-**Parameters**
+- **hid** (`torch.Tensor`): Hidden states `[B, L, H]`.
+- **k_spot_vec** (`torch.Tensor`): Number of spot tokens to drop per example `[B]`.
+- **k_neig_vec** (`torch.Tensor`): Number of neighbor tokens to drop per example `[B]`.
+- **half_size** (`int`): Split point between halves.
 
-* **item** (`int` or `Tuple[int, ...]`): Token(s) to convert.
+Returns a new tensor `[B, L', H]` with halves trimmed and repadded.
 
-**Returns**
 
-* **str** or **Tuple\[str, ...]**: Corresponding gene symbol(s).
+#### remove_front_per_example_halves_2d
 
----
-### n_detections
 ```python
-def n_detections(
-    token: int,
-    dict_list: List[Dict[Any, Any]],
-    mode: str,
-    anchor_token: Any
-) -> int
+def remove_front_per_example_halves_2d(
+    ids: torch.Tensor,
+    k_spot_vec: torch.Tensor,
+    k_neig_vec: torch.Tensor,
+    half_size: int
+) -> torch.Tensor
 ```
 
-Count total similarity entries for a given token across all dictionaries.
+Same as `remove_front_per_example_halves`, but applied to token IDs instead of embeddings.
 
-**Parameters**
+- **ids** (`torch.Tensor`): Token IDs `[B, L]`.
+- **k_spot_vec** (`torch.Tensor`): Spot-side drops per example.
+- **k_neig_vec** (`torch.Tensor`): Neighbor-side drops per example.
+- **half_size** (`int`): Split point between halves.
 
-* **token** (`int`): Token ID to tally.
-* **dict\_list** (`List[Dict]`): List of similarity dictionaries.
-* **mode** (`str`): `'cell'` counts `(token, 'cell_emb')`; `'gene'` counts `(anchor_token, token)`.
-* **anchor\_token** (`Any`): Reference token for gene mode.
+Returns a new token ID tensor `[B, L']` with zeros as padding.
 
-**Returns**
-
-* **int**: Total number of detections.
-
----
-### get_fdr
-```python
-def get_fdr(
-    pvalues: Sequence[float]
-) -> List[float]
-```
-
-Adjust a list of p-values for false discovery rate via Benjamini–Hochberg.
-
-**Parameters**
-
-* **pvalues** (`Sequence[float]`): Raw p-values from statistical tests.
-
-**Returns**
-
-* **List\[float]**: FDR-corrected p-values, same order as input.
-
----
-### get_impact_component
-```python
-def get_impact_component(
-    test_value: float,
-    gaussian_mixture_model: GaussianMixture
-) -> int
-```
-
-Determine which component (impact vs. non-impact) a value belongs to in a 2-component GMM.
-
-**Parameters**
-
-* **test\_value** (`float`): Observed shift statistic.
-* **gaussian\_mixture\_model** (`GaussianMixture`): Fitted 2-component model.
-
-**Returns**
-
-* **int**: Component index (`0` or `1`) indicating impact group.
 
 ---
 
-### find
+## Perturbation Statistics (`perturb_stats.py`)
+
+This module aggregates raw cosine similarity pickles, performs statistical tests, and
+writes CSV summaries for different analysis modes.
+
+### Low-level helpers
+
+These functions are intended for internal use but are documented here for completeness.
+
+#### _is_pickle_path
+
 ```python
-def find(
-    variable: Any,
-    x: Any
-) -> bool
+def _is_pickle_path(p: Union[str, os.PathLike]) -> bool
 ```
 
-Utility to test membership or equality robustly.
+Return `True` if the path ends with `.pkl` or `.pickle`.
 
-**Parameters**
+#### _load_raw_pickle
 
-* **variable** (`Any`): Value or iterable to search.
-* **x** (`Any`): Element to test for.
-
-**Returns**
-
-* **bool**: `True` if `x` equals or is contained in `variable`, else `False`.
-
----
-
-### isp_aggregate_grouped_perturb
 ```python
-def isp_aggregate_grouped_perturb(
-    cos_sims_df: pd.DataFrame,
-    dict_list: List[Dict[Any, Any]],
-    genes_perturbed: List[Any]
-) -> pd.DataFrame
+def _load_raw_pickle(path: Union[str, os.PathLike]) -> dict
 ```
 
-Aggregate cosine-shift data for a specific gene or group perturbation across cells.
+Load a single pickled raw similarity dictionary from `path`.
 
-**Parameters**
 
-* **cos\_sims\_df** (`pd.DataFrame`): DataFrame with columns `'Gene'`, `'Gene_name'`, `'Ensembl_ID'`.
-* **dict\_list** (`List[Dict]`): Similarity dictionaries for each cell.
-* **genes\_perturbed** (`List[Any]`): Gene IDs in the perturbation group.
+#### _iter_raw_pickles
 
-**Returns**
-
-* **pd.DataFrame**: Concatenated DataFrame with `'Cosine_sim'` and `'Gene'` columns for each perturbation.
-
----
-### isp_aggregate_gene_shifts
 ```python
-def isp_aggregate_gene_shifts(
-    cos_sims_df: pd.DataFrame,
-    dict_list: List[Dict[Any, Any]],
-    gene_token_id_dict: Dict[int, str],
-    gene_id_name_dict: Dict[str, str]
-) -> pd.DataFrame
+def _iter_raw_pickles(path_or_dir: Union[str, os.PathLike]) -> Iterable[dict]
 ```
 
-Summarize mean, standard deviation, and count of cosine shifts per gene.
+Yield raw dictionaries from either a single pickle file or all `*_raw.pickle` files
+within a directory.
 
-**Parameters**
 
-* **cos\_sims\_df** (`pd.DataFrame`): Initial gene list DataFrame.
-* **dict\_list** (`List[Dict]`): Similarity dictionaries.
-* **gene\_token\_id\_dict** (`Dict[int, str]`): Token→Ensembl ID mapping.
-* **gene\_id\_name\_dict** (`Dict[str, str]`): Ensembl ID→gene name mapping.
+#### _bh_fdr
 
-**Returns**
-
-* **pd.DataFrame**: Table with columns `['Perturbed','Gene_name','Ensembl_ID','Affected','Affected_gene_name','Affected_Ensembl_ID','Cosine_sim_mean','Cosine_sim_stdev','N_Detections']`.
-
----
-### isp_stats_to_goal_state
 ```python
-def isp_stats_to_goal_state(
-    cos_sims_df: pd.DataFrame,
-    result_dict: Dict[Any, List[float]],
-    cell_states_to_model: Dict[str, Any],
-    genes_perturbed: Union[str, List[Any]]
-) -> pd.DataFrame
+def _bh_fdr(pvals: Sequence[float]) -> List[float]
 ```
 
-Compute shifts for perturbations toward goal vs. alternate or random states.
+Apply Benjamini–Hochberg FDR correction to a list of p-values.
 
-**Parameters**
 
-* **cos\_sims\_df** (`pd.DataFrame`): Base gene list DataFrame.
-* **result\_dict** (`Dict`): Aggregated similarity lists keyed by state.
-* **cell\_states\_to\_model** (`Dict[str, Any]`): Contains `'state_key','start_state','goal_state','alt_states'`.
-* **genes\_perturbed** (`'all'` or `List[Any]`): Genes tested.
+#### _mannwhitney_u_vs_zero
 
-**Returns**
-
-* **pd.DataFrame**: Shifts and p-values (and FDR) for goal and alternate states.
-
----
-### isp_stats_vs_null
 ```python
-def isp_stats_vs_null(
-    cos_sims_df: pd.DataFrame,
-    dict_list: List[Dict[Any, Any]],
-    null_dict_list: List[Dict[Any, Any]]
-) -> pd.DataFrame
+def _mannwhitney_u_vs_zero(x: np.ndarray) -> float
 ```
 
-Compare perturbation shifts against a null distribution.
+Approximate a two-sided Mann–Whitney U test comparing `x` against a degenerate
+distribution at zero, returning a p-value in `[0, 1]`.
 
-**Parameters**
 
-* **cos\_sims\_df** (`pd.DataFrame`): Base gene list DataFrame.
-* **dict\_list** (`List[Dict]`): Test similarity dictionaries.
-* **null\_dict\_list** (`List[Dict]`): Null similarity dictionaries.
+#### _safe_mean_std
 
-**Returns**
-
-* **pd.DataFrame**: Test vs. null shifts, p-values, and FDR in columns `['Test_avg_shift','Null_avg_shift','Test_vs_null_avg_shift','Test_vs_null_pval','Test_vs_null_FDR','Sig']`.
-
----
-### isp_stats_mixture_model
 ```python
-def isp_stats_mixture_model(
-    cos_sims_df: pd.DataFrame,
-    dict_list: List[Dict[Any, Any]],
-    combos: int,
-    anchor_token: Any
-) -> pd.DataFrame
+def _safe_mean_std(vals: Sequence[float]) -> Tuple[float, float]
 ```
 
-Fit a 2-component GMM to identify impact vs. non-impact perturbations.
-
-**Parameters**
-
-* **cos\_sims\_df** (`pd.DataFrame`): Base gene list DataFrame.
-* **dict\_list** (`List[Dict]`): Similarity dictionaries.
-* **combos** (`int`): 0 for single-gene, 1 for pairwise perturbations.
-* **anchor\_token** (`Any`): Reference token for combos.
-
-**Returns**
-
-* **pd.DataFrame**: GMM component assignments and related statistics, including `['Impact_component','Impact_component_percent','N_Detections']`.
-
----
+Compute mean and standard deviation, returning `NaN` for empty input.
 
 
-### invert_dict
+#### _merge_raw_dicts
+
 ```python
-def invert_dict(
-    dictionary: Dict[Any, Any]
-) -> Dict[Any, Any]
+def _merge_raw_dicts(dicts: List[dict]) -> dict
 ```
 
-Swap keys and values in a dictionary.
+Merge a list of raw similarity dictionaries by concatenating lists of values for identical keys.
 
-**Parameters**
 
-* **dictionary** (`Dict[Any, Any]`): Original mapping from keys to values.
+#### _split_cell_gene_subdicts
 
-**Returns**
-
-* **Dict\[Any, Any]**: A new dictionary where each original value is now a key, and each original key is its corresponding value.
-
----
-### read_dict
 ```python
-def read_dict(
-    cos_sims_dict: Dict[Any, Any],
-    cell_or_gene_emb: str,
-    anchor_token: Any
-) -> List[Dict[Any, Any]]
+def _split_cell_gene_subdicts(raw: dict) -> Tuple[dict, dict]
 ```
 
-Extract structured cell or gene embedding entries from a raw cosine-similarity dictionary.
+Split a raw dictionary into two sub-dictionaries: cell-level entries and gene-level entries.
 
-**Parameters**
+- Cell dict keys: `(pert_token, "cell_emb")`.
+- Gene dict keys: `(pert_token, affected_token)`.
 
-* **cos\_sims\_dict** (`Dict[Any, Any]`): Raw similarity results mapping tokens or token pairs to score lists.
-* **cell\_or\_gene\_emb** (`str`): Mode flag, either `'cell'` or `'gene'`, to select which entries to extract.
-* **anchor\_token** (`Any`): Reference token used when filtering gene-mode entries; if `None`, returns all non-empty gene entries.
 
-**Returns**
+#### _token_to_name
 
-* **List\[Dict\[Any, Any]]**: A list containing a single filtered dictionary of embeddings.
-
----
-### read_dictionaries
 ```python
-def read_dictionaries(
-    input_data_directory: str,
-    cell_or_gene_emb: str,
-    anchor_token: Any,
-    cell_states_to_model: Optional[Dict[str, Any]],
-    pickle_suffix: str
-) -> Union[List[Dict[Any, Any]], Dict[Any, Dict[Any, Any]]]
+def _token_to_name(tok: int, tok2name: Optional[Dict[int, str]]) -> str
 ```
 
-Load and aggregate pickled perturbation result dictionaries.
+Map a token ID to a human-readable gene name if `tok2name` is provided, otherwise return
+the stringified token ID.
 
-**Parameters**
 
-* **input\_data\_directory** (`str`): Path to directory containing raw `.pickle` files.
-* **cell\_or\_gene\_emb** (`str`): `'cell'` or `'gene'` mode for entry extraction.
-* **anchor\_token** (`Any`): Token reference for gene-mode filtering; may be `None`.
-* **cell\_states\_to\_model** (`Dict[str, Any]`, optional): Specifies state-key and state values for aggregation; if `None`, returns a flat list.
-* **pickle\_suffix** (`str`): Filename suffix (e.g., `"_raw.pickle"`) to identify relevant files.
+### Mode-specific aggregation functions
 
-**Returns**
+These helpers implement the concrete CSV outputs for each analysis mode.
 
-* **List\[Dict\[Any, Any]]**: If `cell_states_to_model` is `None`, list of per-file dictionaries.
-* **Dict\[Any, Dict\[Any, Any]]**: If modeling states, maps each state to its aggregated dictionary.
+#### _mode_aggregate_data
 
----
-### get_gene_list
 ```python
-def get_gene_list(
-    dict_list: Union[List[Dict[Any, Any]], Dict[Any, Dict[Any, Any]]],
+def _mode_aggregate_data(
+    raw_merged: dict,
+    tok2name: Optional[Dict[int, str]],
+    out_csv: Union[str, os.PathLike]
+) -> str
+```
+
+Aggregate cell-level cosine shift statistics for a single perturbation.
+
+Produces a CSV with columns `['Perturbed','Cosine_sim_mean','Cosine_sim_stdev','N_Detections']`.
+
+#### _mode_aggregate_gene_shifts
+
+```python
+def _mode_aggregate_gene_shifts(
+    raw_merged: dict,
+    tok2name: Optional[Dict[int, str]],
+    out_csv: Union[str, os.PathLike],
+    tok2ens: Optional[Dict[int, str]] = None
+) -> str
+```
+
+Aggregate gene-level cosine shift statistics for all `(perturbed, affected)` token pairs.
+
+Outputs a CSV describing per-gene means, standard deviations, and detection counts, including
+both gene names and ENSEMBL IDs.
+
+
+#### _mode_vs_null
+
+```python
+def _mode_vs_null(
+    raw_merged: dict,
+    null_merged: dict,
+    tok2name: Optional[Dict[int, str]],
+    out_csv: Union[str, os.PathLike]
+) -> str
+```
+
+Compare cell-level perturbation shifts to a null distribution built from separate runs.
+
+Outputs per-perturbation means and standard deviations for test and null distributions,
+as well as p-values and FDR-adjusted q-values.
+
+
+#### _mode_goal_state_shift
+
+```python
+def _mode_goal_state_shift(
+    raw_by_state: Dict[str, dict],
+    state_cfg: dict,
+    tok2name: Optional[Dict[int, str]],
+    out_csv: Union[str, os.PathLike]
+) -> str
+```
+
+Compare perturbation shifts between start and goal cell states (and optional alternative states)
+using nonparametric tests, generating start/goal/alt summaries with p- and q-values.
+
+
+#### _mode_mixture_model
+
+```python
+def _mode_mixture_model(
+    raw_merged: dict,
+    tok2name: Optional[Dict[int, str]],
+    out_csv: Union[str, os.PathLike]
+) -> str
+```
+
+Fit a two-component Gaussian mixture model to per-gene mean shifts and label which component
+represents the high-impact (stronger negative) shift cluster, along with the fraction of genes
+in that component.
+
+
+### class: PerturberStats
+
+```python
+@dataclass
+class PerturberStats:
     mode: str
-) -> List[Any]
+    top_k: Optional[int] = None
+    nperms: Optional[int] = None
+    fdr_alpha: float = 0.05
+    min_cells: int = 1
+    token_dictionary_file: Optional[Dict[str, int]] = None
+    gene_id_name_dict: Optional[Dict[str, str]] = None
+    cell_states_to_model: Optional[dict] = None
 ```
 
-Compile a sorted list of unique gene identifiers from aggregated entries.
+Configure the type of perturbation statistics to compute and provide optional dictionaries
+for mapping tokens to gene names and cell states.
 
-**Parameters**
+**Parameters (init)**
 
-* **dict\_list** (`List[Dict]` or `Dict`): Output from `read_dictionaries` containing similarity records.
-* **mode** (`str`): `'cell'` or `'gene'`, to select token position (0 or 1) when extracting keys.
+- **mode** (`str`): Statistical analysis mode. Supported values include:
+  - `"aggregate_data"`: Aggregate cell-level cosine shifts.
+  - `"aggregate_gene_shifts"`: Aggregate per-gene cosine shifts.
+  - `"vs_null"`: Compare perturbation shifts vs. a null distribution.
+  - `"goal_state_shift"`: Compare start vs goal states (and alt states) defined in
+    `cell_states_to_model`.
+  - `"mixture_model"`: Fit a Gaussian mixture model to per-gene mean shifts.
+- **top_k** (`int` or `None`): Optional limit on the number of strongest results to retain (reserved
+  for future use; not enforced in current implementation).
+- **nperms** (`int` or `None`): Number of permutations for permutation-based modes (currently unused).
+- **fdr_alpha** (`float`): Target FDR threshold for significance; used to interpret q-values.
+- **min_cells** (`int`): Minimum number of cells required to include a perturbation in outputs.
+- **token_dictionary_file** (`dict` or `None`): Mapping ENSEMBL ID → token ID for token name resolution.
+- **gene_id_name_dict** (`dict` or `None`): Mapping ENSEMBL ID → gene symbol used in outputs.
+- **cell_states_to_model** (`dict` or `None`): Configuration for state-aware statistics containing keys
+  such as `"state_key"`, `"start_state"`, `"goal_state"`, and optional `"alt_states"`.
 
-**Returns**
 
-* **List\[Any]**: Sorted list of unique gene tokens or cell identifiers.
+#### _tok_maps
 
----
-### token_tuple_to_ensembl_ids
 ```python
-def token_tuple_to_ensembl_ids(
-    token_tuple: Union[Tuple[int, ...], int],
-    gene_token_id_dict: Dict[int, str]
-) -> Union[Tuple[Optional[str], ...], Optional[str]]
+def _tok_maps(self)
 ```
 
-Map one or more token IDs to Ensembl gene IDs using a lookup.
+Build mapping dictionaries from token IDs to gene names and ENSEMBL IDs based on
+`token_dictionary_file` and `gene_id_name_dict`. Returns `(tok2name, tok2ens)` or `(None, None)`
+if required dictionaries are missing.
+
+
+#### _load_and_merge
+
+```python
+def _load_and_merge(self, path_or_dir: Union[str, os.PathLike]) -> dict
+```
+
+Load one or more raw similarity pickles from a file or directory and return a merged dictionary.
+
+
+#### _load_by_state
+
+```python
+def _load_by_state(self, base_dir: Union[str, os.PathLike]) -> Dict[str, dict]
+```
+
+Load state-specific raw dictionaries from subdirectories under `base_dir`, where each subdirectory
+name corresponds to a state listed in `cell_states_to_model`.
+
+
+### compute_stats
+
+```python
+def compute_stats(
+    self,
+    input_data_dir: str,
+    null_data_dir: Optional[str],
+    output_dir: str,
+    output_prefix: str
+) -> str
+```
+
+Main entry point for computing perturbation statistics and writing CSV files.
 
 **Parameters**
 
-* **token\_tuple** (`int` or `Tuple[int, ...]`): Single token ID or tuple of token IDs.
-* **gene\_token\_id\_dict** (`Dict[int, str]`): Mapping from token ID to Ensembl ID.
+- **input_data_dir** (`str`): Directory containing one or more raw pickle files produced by `Perturber`.
+- **null_data_dir** (`str` or `None`): Directory containing null-distribution pickles, required for
+  `"vs_null"` mode.
+- **output_dir** (`str`): Directory where CSV output will be written.
+- **output_prefix** (`str`): Prefix for output CSV filenames.
 
 **Returns**
 
-* **Tuple\[str, ...]** or **str**: Corresponding Ensembl IDs, or `None` where no mapping exists.
+- **str**: Path to the generated CSV file for the selected `mode`.
 
+**Description**
+
+Depending on `self.mode`, this method:
+
+- Loads and merges raw similarity dictionaries from `input_data_dir` (and optionally `null_data_dir`).
+- Converts token IDs to gene names and ENSEMBL IDs if mapping dictionaries are available.
+- Delegates to an appropriate mode-specific helper:
+  - `"aggregate_data"` → `_mode_aggregate_data`
+  - `"aggregate_gene_shifts"` → `_mode_aggregate_gene_shifts`
+  - `"vs_null"` → `_mode_vs_null`
+  - `"goal_state_shift"` → `_mode_goal_state_shift`
+  - `"mixture_model"` → `_mode_mixture_model`
+- Creates `output_dir` if necessary and writes a CSV summarizing the perturbation effects.
