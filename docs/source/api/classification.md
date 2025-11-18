@@ -1,527 +1,676 @@
 # Classification
 
+This documentation describes the current classification API used with STFormer-style
+models. It covers:
+
+- The high-level `Classifier` orchestration class (`Classifier.py`)
+- Data utilities and collators (`classifier_utils.py`)
+- Evaluation helpers (`evaluation_utils.py`)
+
+The goal is to give a single place to understand how to prepare datasets, train
+sequence- or gene-level classifiers, and evaluate their performance.
+
+---
+
 ## Classifier
+
+```python
+from Classifier import Classifier
+```
 
 ```python
 class Classifier:
     def __init__(
         self,
-        metadata_column: str,
-        classifier_type: str = 'sequence',
-        gene_class_dict: dict | None = None,
-        label_mapping: dict[str, int] | None = None,
-        token_dictionary_file: str | None = None,
-        filter_data: dict | None = None,
+        metadata_column,
+        mode: str = "spot",
+        classifier_type: str = "sequence",
+        gene_class_dict=None,
+        label_mapping=None,
+        token_dictionary_file=None,
+        filter_data=None,
         rare_threshold: float = 0.0,
-        max_examples: int | None = None,
-        max_examples_per_class: int | None = None,
-        training_args: dict | None = None,
-        ray_config: dict | None = None,
+        max_examples=None,
+        max_examples_per_class=None,
+        training_args=None,
+        ray_config=None,
         freeze_layers: int = 0,
-        forward_batch_size: int = 48,
-        nproc: int = 4
+        forward_batch_size: int = 32,
+        nproc: int = 4,
     )
 ```
-Configure and instantiate a sequence or token classification pipeline.
 
-**Description**  
-Stores settings for data filtering, label mapping, training arguments (with defaults), and optional Ray Tune hyperparameter search.
+A flexible orchestration class that:
 
-**Parameters**  
-- **metadata_column** (`str`): Column name in dataset holding original labels.  
-- **classifier_type** (`str`, default `'sequence'`): `'sequence'` for one label per example; `'token'` for per-token labels.  
-- **gene_class_dict** (`dict`, optional): Required if `classifier_type` is `'token'`; maps class names to gene token lists.  
-- **label_mapping** (`dict[str,int]`, optional): Predefined mapping from label values to integer IDs.  
-- **token_dictionary_file** (`str`, optional): Path to token vocabulary pickle (required for token classification).  
-- **filter_data** (`dict`, optional): Metadata filters to apply before labeling.  
-- **rare_threshold** (`float`, default `0.0`): Drop labels whose frequency falls below this fraction.  
-- **max_examples** (`int`, optional): Global cap on number of examples after filtering.  
-- **max_examples_per_class** (`int`, optional): Cap per-class when downsampling.  
-- **training_args** (`dict`, optional): Overrides for Hugging Face `TrainingArguments`.  
-- **ray_config** (`dict`, optional): Ranges for hyperparameters to tune via Ray Tune.  
-- **freeze_layers** (`int`, default `0`): Number of initial transformer layers to freeze during training.  
-- **forward_batch_size** (`int`, default `48`): Batch size used for evaluation and prediction.  
-- **nproc** (`int`, default `4`): Number of processes for dataset operations.
+1. Loads and filters a Hugging Face dataset.
+2. Builds label columns for either **sequence-level** or **gene-level** classification.
+3. Configures and launches Hugging Face `Trainer` (or Ray Tune for hyperparameter search).
+4. Saves labeled datasets, trained models, and predictions.
+
+### Parameters (init)
+
+- **metadata_column** (`str`):  
+  Name of the column in the dataset that contains the original labels
+  (e.g. `"cell_type"`, `"treatment"`).
+
+- **mode** (`str`, default `"spot"`):  
+  Tokenization mode, relevant for gene-level classification:
+  - `"spot"` – sequences are treated as single spots.
+  - `"extended"` – sequences are spot + neighbor concatenations. For gene-level
+    classification, labels in the neighbor half are masked out with `-100` so that
+    only the first half is supervised.
+
+- **classifier_type** (`str`, default `"sequence"`):  
+  Type of classifier to train:
+  - `"sequence"` – one label per example (cell/spot classification).
+  - `"gene"` – per-token labels (gene-level classification, implemented as a
+    token classification head).
+
+- **gene_class_dict** (`dict | None`):  
+  Required when `classifier_type="gene"`. A mapping from class name to a **list of
+  gene IDs or tokens** belonging to that class. Used by `label_classes` to build
+  token-level labels.
+
+- **label_mapping** (`dict | None`):  
+  Optional mapping from **label value → class ID**. If `None`, the mapping is
+  inferred automatically from the data during `prepare_data` and stored on
+  `self.label_mapping`.
+
+- **token_dictionary_file** (`str | None`):  
+  Path to a pickle file containing a token vocabulary dictionary. Required for
+  gene-level classification so gene identifiers in `gene_class_dict` can be
+  mapped to token IDs.
+
+- **filter_data** (`dict | None`):  
+  Optional metadata filters applied before labeling. The dict should map
+  `column_name → allowed_values`.
+
+- **rare_threshold** (`float`, default `0.0`):  
+  Minimum fraction for a label to be kept. Any label whose frequency is below
+  `rare_threshold` is dropped via `remove_rare`.
+
+- **max_examples** (`int | None`):  
+  Global cap on the number of examples after filtering. If `None`, all remaining
+  examples are kept.
+
+- **max_examples_per_class** (`int | None`):  
+  Per-class cap when downsampling. If provided, at most this many examples per
+  class are retained after shuffling.
+
+- **training_args** (`dict | None`):  
+  Keyword arguments merged into `Classifier.default_training_args` to construct
+  Hugging Face `TrainingArguments`.
+
+- **ray_config** (`dict | None`):  
+  Hyperparameter search space for Ray Tune. If set and `n_trials > 0` is passed
+  to `train`, the training will be delegated to `_ray_tune`.
+
+- **freeze_layers** (`int`, default `0`):  
+  Number of initial transformer encoder layers to freeze.
+
+- **forward_batch_size** (`int`, default `32`):  
+  Batch size used during evaluation and for scaling the effective training batch
+  size.
+
+- **nproc** (`int`, default `4`):  
+  Number of worker processes used in dataset filtering and mapping operations.
 
 ---
 
-### load_tokenizer
+### build_custom_tokenizer
 
 ```python
-_load_tokenizer(
-    name_or_path: str
-) -> PreTrainedTokenizerFast | AutoTokenizer
+from Classifier import build_custom_tokenizer
+
+tokenizer = build_custom_tokenizer(
+    token_dict_path: str,
+    pad_token: str = "<pad>",
+    mask_token: str = "<mask>",
+)
 ```
-Load a tokenizer from a path or pretrained name.
 
-**Description**  
-Determines if `name_or_path` points to a pickle (custom vocab) or a standard pretrained identifier, returning the appropriate tokenizer.
+Build a `PreTrainedTokenizerFast` from a custom token vocabulary stored as a
+pickle.
 
-**Parameters**  
-- **name_or_path** (`str`): Path to tokenizer pickle or Hugging Face model name.
+#### Parameters
 
-**Returns**  
-- **PreTrainedTokenizerFast** or **AutoTokenizer** instance.
+- **token_dict_path** (`str`):  
+  Path to a pickle file containing a `dict[str, int]` vocabulary.
+
+- **pad_token** (`str`, default `"<pad>"`):  
+  Token used for padding sequences.
+
+- **mask_token** (`str`, default `"<mask>"`):  
+  Token used to indicate masked positions.
+
+#### Returns
+
+- **PreTrainedTokenizerFast** – ready-to-use tokenizer instance.
 
 ---
 
-### ray_tune
+### _load_tokenizer
 
 ```python
-_ray_tune(
-    model_checkpoint: str,
-    dataset_path: str,
-    output_directory: str,
-    eval_dataset_path: str | None,
-    n_trials: int,
-    test_size: float,
-    tokenizer_name_or_path: str | None
-) -> ExperimentAnalysis
+tokenizer = classifier._load_tokenizer(
+    name_or_path: str,
+)
 ```
-Run Ray Tune hyperparameter search and save best model.
 
-**Description**  
-Sets up Ray, defines search space from `ray_config`, performs hyperparameter search, and saves the best checkpoint and tokenizer.
+Internal helper to load a tokenizer from:
 
-**Parameters**  
-- **model_checkpoint** (`str`): Pretrained model name or path.  
-- **dataset_path** (`str`): Path to labeled dataset.  
-- **output_directory** (`str`): Directory for tune results and best model.  
-- **eval_dataset_path** (`str` | None): Optional eval dataset path.  
-- **n_trials** (`int`): Number of search trials.  
-- **test_size** (`float`): Fraction for auto-split if no eval dataset.  
-- **tokenizer_name_or_path** (`str` | None): Tokenizer override.
+- A Hugging Face model name (e.g. `"bert-base-uncased"`),
+- A local tokenizer directory,
+- Or a pickled token dictionary (delegating to `build_custom_tokenizer`).
 
-**Returns**  
-- **ExperimentAnalysis** from the Ray Tune run.
+You usually do **not** call this directly; it is used inside `train` and
+`evaluate`.
 
 ---
 
 ### prepare_data
 
 ```python
-prepare_data(
-    input_data: str | Dataset,
+dataset_path, label_map_path = classifier.prepare_data(
+    input_data,
     output_directory: str,
-    output_prefix: str
-) -> tuple[str, str]
+    output_prefix: str,
+)
 ```
-Filter, label, and save a Hugging Face dataset for classification.
 
-**Description**  
-Applies metadata filters, removes rare classes, downsamples, maps original labels to integer `label`, and writes the labeled dataset and label mapping to disk.
+Filter, downsample, and label a dataset for classification, then save it to disk.
 
-**Parameters**  
-- **input_data** (`str` or `Dataset`): Path or in-memory Hugging Face dataset.  
-- **output_directory** (`str`): Directory where outputs will be saved.  
-- **output_prefix** (`str`): Filename prefix for saved dataset and mapping.
+The method:
 
-**Returns**  
-- Tuple of (`dataset_path`, `label_map_path`), where:
-  - **dataset_path** (`str`): Path to `{output_prefix}_labeled.dataset`.  
-  - **label_map_path** (`str`): Path to `{output_prefix}_id_class_dict.pkl`.
+1. Loads the dataset via `classifier_utils.load_and_filter`.
+2. Drops rare labels using `classifier_utils.remove_rare`.
+3. Optionally down-samples using `downsample_and_shuffle`.
+4. Builds label columns:
+   - `"sequence"` classifier: one `label` column.
+   - `"gene"` classifier: per-token `labels` sequences via `label_classes`. In
+     `"extended"` mode, only the first half is supervised (second half set to
+     `-100`).
+5. Saves the dataset (`DatasetDict`) with `save_to_disk`.
+6. Saves the label mapping to a pickle.
+
+#### Parameters
+
+- **input_data** (`str | Dataset | DatasetDict`):  
+  Either a path to a dataset saved with `load_from_disk` or an in-memory
+  dataset.
+
+- **output_directory** (`str`):  
+  Directory to write the labeled dataset and label map.
+
+- **output_prefix** (`str`):  
+  Prefix used for the saved dataset and mapping filenames.
+
+#### Returns
+
+- **dataset_path** (`str`):  
+  Path to the labeled dataset directory.
+
+- **label_map_path** (`str`):  
+  Path to the pickled `id_class_dict` mapping.
 
 ---
-
 
 ### train
 
 ```python
-train(
+trainer_or_result = classifier.train(
     model_checkpoint: str,
     dataset_path: str,
     output_directory: str,
-    eval_dataset: str | Dataset | None = None,
+    eval_dataset=None,
     n_trials: int = 0,
     test_size: float = 0.2,
-    tokenizer_name_or_path: str | None = None
-) -> Trainer
+    tokenizer_name_or_path: str | None = None,
+)
 ```
-Train or hyperparameter-tune a classification model.
 
-**Description**  
-Auto-splits train/test if needed, loads datasets, configures tokenizer and collator, initializes model and `Trainer`, optionally runs Ray Tune, and trains. Saves final model and predictions.
+Train a classifier (sequence or gene-level) or run Ray Tune hyperparameter
+search, depending on `ray_config` and `n_trials`.
 
-**Parameters**  
-- **model_checkpoint** (`str`): Pretrained model name or local path.  
-- **dataset_path** (`str`): Directory of labeled dataset from `prepare_data()`.  
-- **output_directory** (`str`): Directory to save checkpoints and outputs.  
-- **eval_dataset** (`str` | `Dataset`, optional): Separate eval set; if None, auto-splits by `test_size`.  
-- **n_trials** (`int`, default `0`): Number of Ray Tune trials (requires `ray_config`).  
-- **test_size** (`float`, default `0.2`): Fraction of data for test split.  
-- **tokenizer_name_or_path** (`str`, optional): Override tokenizer source.
+#### Behavior
 
-**Returns**  
-- **Trainer**: A Hugging Face `Trainer` instance after training.
+- If `ray_config` is set **and** `n_trials > 0`:
+  - Delegates to `_ray_tune`, which runs Ray Tune over the provided hyperparameter
+    space and returns the tuning result.
+
+- Otherwise:
+  1. Loads the labeled dataset from `dataset_path`.
+  2. If `eval_dataset` is `None`, creates a train/eval split using `test_size`.
+  3. Loads a tokenizer (model checkpoint or `tokenizer_name_or_path`).
+  4. Chooses collator:
+     - `DataCollatorForCellClassification` when `classifier_type="sequence"`.
+     - `DataCollatorForGeneClassification` when `classifier_type="gene"`.
+  5. Builds a classification model using `AutoModelForSequenceClassification` or
+     `AutoModelForTokenClassification`.
+  6. Instantiates a `Trainer` with:
+     - training args (`TrainingArguments`),
+     - `compute_metrics` from `evaluation_utils` as `compute_metrics`,
+     - the chosen collator and datasets.
+  7. Calls `trainer.train()`.
+  8. Saves:
+     - final model and tokenizer in `{output_directory}/final_model`,
+     - predictions on eval set to `{output_directory}/predictions.pkl`.
+
+#### Parameters
+
+- **model_checkpoint** (`str`):  
+  Hugging Face model name or local path to the backbone to fine-tune.
+
+- **dataset_path** (`str`):  
+  Path to the labeled dataset created by `prepare_data`.
+
+- **output_directory** (`str`):  
+  Directory where checkpoints, final models, and prediction files are stored.
+
+- **eval_dataset** (`str | Dataset | DatasetDict | None`, default `None`):  
+  Optional separate evaluation dataset. If `None`, the dataset at `dataset_path`
+  is split into train/eval.
+
+- **n_trials** (`int`, default `0`):  
+  Number of Ray Tune trials to run. If `> 0` and `ray_config` is set, triggers
+  hyperparameter search.
+
+- **test_size** (`float`, default `0.2`):  
+  Fraction of data reserved for evaluation when `eval_dataset` is not provided.
+
+- **tokenizer_name_or_path** (`str | None`):  
+  Optional explicit tokenizer source. If `None`, `model_checkpoint` is used.
+
+#### Returns
+
+- **Trainer** – trained Hugging Face `Trainer` instance, or  
+- Ray Tune result object when `_ray_tune` is used.
 
 ---
-
-## Predictions
 
 ### evaluate
 
 ```python
-evaluate(
+metrics = classifier.evaluate(
     model_directory: str,
     eval_dataset_path: str,
     id_class_dict_file: str,
     output_directory: str,
-    tokenizer_name_or_path: str | None = None
-) -> dict
+    tokenizer_name_or_path: str | None = None,
+)
 ```
-Evaluate a trained classification model.
 
-**Description**  
-Loads model, tokenizer, and dataset, sets up a `Trainer`, runs evaluation, and logs metrics.
+Evaluate a trained model on a labeled dataset.
 
-**Parameters**  
-- **model_directory** (`str`): Directory containing the saved model and tokenizer.  
-- **eval_dataset_path** (`str`): Path to the dataset for evaluation.  
-- **id_class_dict_file** (`str`): Pickle file mapping class labels to IDs.  
-- **output_directory** (`str`): Directory to write evaluation logs.  
-- **tokenizer_name_or_path** (`str`, optional): Override tokenizer path.
+#### Behavior
 
-**Returns**  
-- **dict**: Evaluation metrics from `Trainer.evaluate()`.
+1. Loads model + tokenizer from `model_directory`.
+2. Loads eval dataset from `eval_dataset_path`.
+3. Loads the class mapping from `id_class_dict_file`.
+4. Recreates the correct collator (sequence vs gene).
+5. Instantiates a `Trainer` with `compute_metrics`.
+6. Calls `trainer.evaluate()` and returns the metrics.
+
+#### Parameters
+
+- **model_directory** (`str`):  
+  Directory containing the trained model and tokenizer (e.g. `final_model`).
+
+- **eval_dataset_path** (`str`):  
+  Path to the evaluation dataset (same format as produced by `prepare_data`).
+
+- **id_class_dict_file** (`str`):  
+  Pickled mapping between class names and class IDs.
+
+- **output_directory** (`str`):  
+  Directory used for any logs or plots (if produced).
+
+- **tokenizer_name_or_path** (`str | None`):  
+  Optional tokenizer override; if `None`, the tokenizer in `model_directory` is
+  used.
+
+#### Returns
+
+- **dict** – metrics dictionary as returned by `Trainer.evaluate()` plus the
+  extra statistics computed by `compute_metrics`.
 
 ---
+
 ### plot_confusion_matrix
 
 ```python
-plot_confusion_matrix(
-    self,
-    conf_mat: Any,
+classifier.plot_confusion_matrix(
+    conf_mat,
     output_directory: str,
     output_prefix: str,
-    class_order: list[str]
-) -> None
+    class_order: list[str],
+)
 ```
-Delegate confusion matrix plotting to utility functions.
 
-**Parameters**  
-- **conf_mat** (`Any`): Confusion matrix array or dict.  
-- **output_directory** (`str`): Directory to save the plot.  
-- **output_prefix** (`str`): Filename prefix for the saved plot.  
-- **class_order** (`list[str]`): Ordered list of class names for axes.
+Thin wrapper around `evaluation_utils.plot_confusion_matrix` that saves a
+heatmap of the confusion matrix.
 
-**Returns**  
-- `None`
+#### Parameters
+
+- **conf_mat** (`np.ndarray` or array-like):  
+  Confusion matrix of shape `(num_classes, num_classes)`.
+
+- **output_directory** (`str`):  
+  Directory where the figure is saved.
+
+- **output_prefix** (`str`):  
+  Prefix for the output filename.
+
+- **class_order** (`list[str]`):  
+  Ordered list of class names for axes labeling.
 
 ---
 
 ### plot_predictions
 
 ```python
-plot_predictions(
-    self,
+classifier.plot_predictions(
     predictions_file: str,
     id_class_dict_file: str,
     title: str,
     output_directory: str,
     output_prefix: str,
-    class_order: list[str]
-) -> None
+    class_order: list[str],
+)
 ```
-Delegate prediction summary plotting to utility functions.
 
-**Parameters**  
-- **predictions_file** (`str`): Path to pickle file with prediction outputs.  
-- **id_class_dict_file** (`str`): Pickle mapping class IDs to names.  
-- **title** (`str`): Title for the plot.  
-- **output_directory** (`str`): Directory to save the plot.  
-- **output_prefix** (`str`): Filename prefix for the saved plot.  
-- **class_order** (`list[str]`): Ordered class names for axes.
+Wrapper around `evaluation_utils.plot_predictions` to visualize prediction
+outputs (saved from `Trainer.predict`).
 
-**Returns**  
-- `None`
+#### Parameters
+
+- **predictions_file** (`str`):  
+  Path to the pickled predictions dict.
+
+- **id_class_dict_file** (`str`):  
+  Pickled mapping between class IDs and names.
+
+- **title** (`str`):  
+  Title for the plot.
+
+- **output_directory** (`str`):  
+  Directory where the prediction plot is saved.
+
+- **output_prefix** (`str`):  
+  Prefix for the output filename.
+
+- **class_order** (`list[str]`):  
+  Ordered list of class names for x/y axes.
 
 ---
 
+## Dataset Utilities (`classifier_utils.py`)
 
-## Classifier Utility Functions
-
-
-### build_custom_tokenizer
-```python
-build_custom_tokenizer(
-    token_dict_path: str,
-    pad_token: str = "<pad>",
-    mask_token: str = "<mask>"
-) -> PreTrainedTokenizerFast
-```
-Build a Hugging Face tokenizer from a pickled vocabulary.
-
-**Description**  
-Loads a token-to-ID mapping from a pickle file and instantiates a `PreTrainedTokenizerFast` with custom special tokens.
-
-**Parameters**  
-- **token_dict_path** (`str`): Path to a pickle file containing a `dict[str, int]` vocabulary.  
-- **pad_token** (`str`, default `"<pad>"`): Token used for padding sequences.  
-- **mask_token** (`str`, default `"<mask>"`): Token used to mark masked positions.
-
-**Returns**  
-- **PreTrainedTokenizerFast**: Tokenizer configured with `<unk>`, `<cls>`, `<sep>`, plus the provided pad/mask tokens.
----
+The `classifier_utils.py` helper module provides a set of functions and collators
+used by `Classifier`.
 
 ### load_and_filter
+
 ```python
-load_and_filter(
-    filter_data: Optional[dict],
+from classifier_utils import load_and_filter
+
+data = load_and_filter(
+    filter_data,
     nproc: int,
-    input_data: Union[str, Dataset]
-) -> Dataset
+    input_data_file,
+)
 ```
 
-Load a Hugging Face dataset from disk or memory and apply metadata filters.
+Load a dataset (from disk or in-memory) and apply metadata filters.
 
-**Description**
-If `input_data` is a string path, loads the dataset via `load_from_disk`; otherwise assumes it is already a `Dataset`. Applies filters for each key–value pair in `filter_data`.
+- **filter_data** (`dict | None`):  
+  Mapping from column name to allowed values.
 
-**Parameters**
+- **nproc** (`int`):  
+  Number of worker processes used for filtering.
 
-* **filter\_data** (`dict` or `None`): Mapping from column names to allowed values.
-* **nproc** (`int`): Number of processes to use for filtering.
-* **input\_data** (`str` or `Dataset`): Path to a saved dataset or an in-memory `Dataset` object.
+- **input_data_file** (`str | Dataset | DatasetDict`):  
+  Path to a dataset saved with `load_from_disk` or a `Dataset`/`DatasetDict`.
 
-**Returns**
-
-* **Dataset**: Filtered Hugging Face `Dataset`.
+Returns a filtered `Dataset` or `DatasetDict`.
 
 ---
+
 ### remove_rare
+
 ```python
-remove_rare(
-    data: Dataset,
+from classifier_utils import remove_rare
+
+data = remove_rare(
+    data,
     rare_threshold: float,
     state_key: str,
-    nproc: int
-) -> Dataset
+    nproc: int,
+)
 ```
 
-Filter out examples whose label frequency falls below a threshold.
+Drop examples whose label frequency is below a threshold.
 
-**Description**
-Computes the frequency of each value in `state_key`. Drops values whose count divided by total examples is below `rare_threshold`.
-
-**Parameters**
-
-* **data** (`Dataset`): Input dataset.
-* **rare\_threshold** (`float`): Minimum fraction for label retention (0–1).
-* **state\_key** (`str`): Column name containing labels to evaluate.
-* **nproc** (`int`): Number of processes for filtering.
-
-**Returns**
-
-* **Dataset**: Dataset with rare-label examples removed.
+- **data** (`Dataset | DatasetDict`): Input dataset.
+- **rare_threshold** (`float`): Minimum frequency (0–1) for label retention.
+- **state_key** (`str`): Column containing label values.
+- **nproc** (`int`): Number of worker processes.
 
 ---
+
 ### downsample_and_shuffle
+
 ```python
-downsample_and_shuffle(
-    data: Dataset,
-    max_ncells: Optional[int],
-    max_ncells_per_class: Optional[int],
-    cell_state_dict: dict
-) -> Dataset
+from classifier_utils import downsample_and_shuffle
+
+data = downsample_and_shuffle(
+    data,
+    max_ncells: int | None,
+    max_ncells_per_class: int | None,
+    cell_state_dict: dict,
+)
 ```
 
-Shuffle and downsample a dataset globally and per class.
+Shuffle and optionally downsample the dataset, globally and per class.
 
-**Description**
-Shuffles examples with a fixed seed, selects up to `max_ncells` total examples, then subsamples each class to at most `max_ncells_per_class` using indices from `cell_state_dict`.
-
-**Parameters**
-
-* **data** (`Dataset`): Input dataset to shuffle and downsample.
-* **max\_ncells** (`int` or `None`): Maximum total examples to retain.
-* **max\_ncells\_per\_class** (`int` or `None`): Maximum examples per class.
-* **cell\_state\_dict** (`dict`): Must contain key `"state_key"` specifying label column name.
-
-**Returns**
-
-* **Dataset**: Downsampled and shuffled dataset.
+- **data** (`Dataset | DatasetDict`): Dataset to downsample.
+- **max_ncells** (`int | None`): Global maximum number of examples.
+- **max_ncells_per_class** (`int | None`): Max per-class examples after shuffling.
+- **cell_state_dict** (`dict`): Mapping from class ID to list of example indices.
 
 ---
+
 ### subsample_by_class
+
 ```python
-subsample_by_class(
-    labels: Sequence,
-    N: int
-) -> List[int]
+from classifier_utils import subsample_by_class
+
+data = subsample_by_class(
+    data,
+    cell_state_dict: dict,
+    max_ncells_per_class: int,
+)
 ```
 
-Select up to N indices per unique label.
-
-**Description**
-Groups indices by label, then randomly samples up to N for each group.
-
-**Parameters**
-
-* **labels** (`Sequence`): List of labels corresponding to each example.
-* **N** (`int`): Maximum number of indices to select per label.
-
-**Returns**
-
-* **List\[int]**: Selected example indices.
+Subsample examples per class according to `max_ncells_per_class`.
 
 ---
+
 ### rename_cols
+
 ```python
-rename_cols(
-    data: Dataset,
-    state_key: str
-) -> Dataset
+from classifier_utils import rename_cols
+
+data = rename_cols(
+    data,
+    mapping: dict[str, str],
+)
 ```
 
-Rename the label column to a standardized name.
-
-**Description**
-Renames the column named by `state_key` to `"label"`.
-
-**Parameters**
-
-* **data** (`Dataset`): Input dataset.
-* **state\_key** (`str`): Original column name to rename.
-
-**Returns**
-
-* **Dataset**: Dataset with `state_key` renamed to `label`.
+Rename dataset columns according to a mapping.
 
 ---
+
 ### flatten_list
+
 ```python
-flatten_list(
-    l: Sequence[Sequence]
-) -> List[Any]
+from classifier_utils import flatten_list
+
+flat = flatten_list(nested_list)
 ```
 
-Flatten a list of lists into a single list.
-
-**Parameters**
-
-* **l** (`Sequence` of sequences): Nested list structure.
-
-**Returns**
-
-* **List\[Any]**: Flat list containing all items.
+Flatten a nested list of lists into a single list.
 
 ---
+
 ### label_classes
+
 ```python
-label_classes(
-    classifier: str,
-    data: Dataset,
-    class_dict: dict[str, Sequence],
-    token_dict_path: str,
-    nproc: int
-) -> Tuple[Dataset, dict]
+from classifier_utils import label_classes
+
+labeled_data, id_class_dict = label_classes(
+    data,
+    gene_class_dict: dict,
+    label_mapping: dict | None,
+    token_dictionary_file: str | None,
+    mode: str = "spot",
+)
 ```
 
-Map string labels to integer class IDs for cell- or gene-level classification.
+Create per-token class labels for gene-level classification.
 
-**Description**
+- **data** (`Dataset | DatasetDict`):  
+  Input tokenized dataset.
 
-* For `classifier="cell"`, enumerates unique `data["label"]` values and remaps.
-* For `classifier="gene"`, loads a token-to-gene mapping, inverts it, builds a token-to-class map from `class_dict`, labels sequences per token, filters out sequences with no valid labels.
+- **gene_class_dict** (`dict`):  
+  Mapping from class name → list of gene IDs/tokens.
 
-**Parameters**
+- **label_mapping** (`dict | None`):  
+  Optional mapping from class name → integer ID. If `None`, it is created.
 
-* **classifier** (`"cell"` or `"gene"`): Determines labeling strategy.
-* **data** (`Dataset`): Input dataset with a `label` or `input_ids` field.
-* **class\_dict** (`dict[str, Sequence]`): Mapping from class names to lists of gene identifiers (for gene classifier).
-* **token\_dict\_path** (`str`): Path to pickle of token-to-gene vocabulary.
-* **nproc** (`int`): Number of processes for dataset mapping/filtering.
+- **token_dictionary_file** (`str | None`):  
+  Path to token dictionary used to map gene IDs to token IDs.
 
-**Returns**
+- **mode** (`str`, default `"spot"`):  
+  `"spot"` for single sequences; `"extended"` for spot + neighbor, where only
+  the first half is supervised.
 
-* **Tuple\[Dataset, dict]**: Labeled dataset and mapping of class names to integer IDs.
-
----
-### predict_from_checkpoint
-```python
-predict_from_checkpoint(
-    model_dir: str,
-    dataset_path: str,
-    classifier_type: str = "sequence",
-    batch_size: int = 32,
-    num_workers: int = 4,
-    return_logits: bool = False
-) -> Union[List[int], Tuple[List[int], np.ndarray]]
-```
-
-Load a trained model and run predictions on a saved dataset.
-
-**Description**
-Loads tokenizer and model (sequence or token), constructs a `Trainer`, and returns predicted class indices, optionally with raw logits.
-
-**Parameters**
-
-* **model\_dir** (`str`): Path to directory containing a saved Hugging Face model and tokenizer.
-* **dataset\_path** (`str`): Path to the saved HF dataset.
-* **classifier\_type** (`str`): `'sequence'` or `'token'` to select model class.
-* **batch\_size** (`int`): Number of examples per inference batch.
-* **num\_workers** (`int`): DataLoader workers.
-* **return\_logits** (`bool`): If True, also return raw logits array.
-
-**Returns**
-
-* **List\[int]** of predicted labels, or `(List[int], np.ndarray)` if `return_logits`.
+Returns the labeled dataset and the `id_class_dict` mapping.
 
 ---
 
-## Data Collators
+### DataCollatorForCellClassification
 
-### class: DataCollatorForCellClassification
 ```python
-class DataCollatorForCellClassification(DataCollatorWithPadding):
-    def __init__(self, tokenizer, padding: str = "max_length", max_length: int = 2048)
-    def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]
+from classifier_utils import DataCollatorForCellClassification
 ```
 
-Pad cell-level batches and extract labels.
+A custom data collator for **sequence-level** classification. It:
 
-**Description**
-Inherits from `DataCollatorWithPadding`; pops each example’s `label`, pads inputs, and stacks labels into `batch["labels"]`.
+- Pads input IDs and attention masks,
+- Collects `labels` as integer class IDs,
+- Returns a batch suitable for `AutoModelForSequenceClassification`.
 
-**Parameters**
-
-* **tokenizer**: Hugging Face tokenizer instance.
-* **padding** (`str`): Padding strategy (`'max_length'` or `'longest'`).
-* **max\_length** (`int`): Maximum sequence length for padding.
-
-**Returns**
-
-* **Dict\[str, torch.Tensor]**: Batch dict with `input_ids`, `attention_mask`, and `labels`.
+You normally do not instantiate this directly; it is constructed inside
+`Classifier.train`.
 
 ---
-### class DataCollatorForGeneClassification
+
+### DataCollatorForGeneClassification
+
 ```python
-class DataCollatorForGeneClassification:
-    def __init__(
-        self,
-        tokenizer,
-        padding: str = "longest",
-        max_length: Optional[int] = None,
-        label_pad_token_id: int = -100,
-        return_tensors: str = "pt"
-    )
-    def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]
+from classifier_utils import DataCollatorForGeneClassification
 ```
 
-Pad gene-level batches with per-token labels.
+A custom data collator for **gene-level** (token) classification. It:
 
-**Description**
-Uses `tokenizer.pad()` to pad `input_ids` and `attention_mask`, then pads each feature’s `labels` list to `max_length` with `label_pad_token_id` and returns a tensor batch.
+- Pads `input_ids` and `labels`,
+- Preserves `-100` values to mark ignored positions,
+- Returns a batch suitable for `AutoModelForTokenClassification`.
 
-**Parameters**
+---
 
-* **tokenizer**: Hugging Face tokenizer instance.
-* **padding** (`str`): Padding strategy (`'max_length'` or `'longest'`).
-* **max\_length** (`int` or `None`): Maximum sequence length.
-* **label\_pad\_token\_id** (`int`): ID to use for padded label positions (`-100`).
-* **return\_tensors** (`str`): Tensor type (`'pt'` for PyTorch).
+## Evaluation Utilities (`evaluation_utils.py`)
 
-**Returns**
+### py_softmax
 
-* **Dict\[str, torch.Tensor]**: Batch dict with padded `input_ids`, `attention_mask`, and `labels`.
+```python
+from evaluation_utils import py_softmax
 
+probs = py_softmax(x, axis=-1)
+```
+
+Pure-Python softmax utility over a NumPy array.
+
+---
+
+### compute_metrics
+
+```python
+from evaluation_utils import compute_metrics
+
+metrics = compute_metrics(eval_pred)
+```
+
+Metric function intended for use with `Trainer`. It typically computes:
+
+- overall accuracy,
+- macro/micro F1,
+- precision and recall,
+- confusion matrix and per-class stats (if labels are available).
+
+It accepts the standard `(predictions, labels)` tuple used by `Trainer`.
+
+---
+
+### evaluate_model
+
+```python
+from evaluation_utils import evaluate_model
+
+metrics = evaluate_model(
+    model,
+    dataloader,
+    device,
+)
+```
+
+Standalone evaluation helper that runs a model over a dataloader and aggregates
+metrics using `compute_metrics`.
+
+---
+
+### plot_confusion_matrix
+
+```python
+from evaluation_utils import plot_confusion_matrix
+
+plot_confusion_matrix(
+    conf_mat,
+    class_order: list[str],
+    output_directory: str,
+    output_prefix: str,
+)
+```
+
+Plot and save a confusion matrix heatmap.
+
+---
+
+### plot_predictions
+
+```python
+from evaluation_utils import plot_predictions
+
+plot_predictions(
+    predictions_file: str,
+    id_class_dict_file: str,
+    title: str,
+    output_directory: str,
+    output_prefix: str,
+    class_order: list[str],
+)
+```
+
+Load saved predictions and class mappings, reconstruct the confusion matrix, and
+save a labeled heatmap to disk.

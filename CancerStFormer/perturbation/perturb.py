@@ -74,6 +74,9 @@ class Config:
     num_classes: int
     emb_layer: int
     token_dictionary_file: Optional[str]
+    anchor_gene: Optional[str] = None
+    cell_states_to_model: Optional[dict] = None
+    cell_emb_style: str = 'mean_pool'
 
     # filtering
     start_state: Optional[Dict[str, Union[str, int, float]]]
@@ -133,6 +136,9 @@ class Perturber:
         num_samples,
         top_k,
         model_type,
+        anchor_gene,
+        cell_states_to_model,
+        cell_emb_style,
         num_classes,
         start_state,
         filter_data,
@@ -250,6 +256,21 @@ class Perturber:
         ens2tok = validate_gene_token_mapping(ens2tok_raw)
         tok2ens = {v: k for k, v in ens2tok.items()}
 
+        if self.cfg.anchor_gene is not None:
+            # accept ENSEMBL or integer token id
+            try:
+                maybe_tok = int(self.cfg.anchor_gene)
+                anchor_token = maybe_tok if maybe_tok in set(ens2tok.values()) else None
+            except Exception:
+                anchor_token = ens2tok.get(str(self.cfg.anchor_gene))
+
+            if anchor_token is None:
+                raise ValueError(f"anchor_gene {self.cfg.anchor_gene!r} not found in token dictionary.")
+
+        # If no explicit genes_to_perturb were provided, fall back to anchor-only mode.
+        if anchor_token is not None and not self.cfg.genes_to_perturb:
+            resolved_perturb = [anchor_token]
+            set_resolved     = {anchor_token}
         def _as_int(x):
             try: return int(x)
             except Exception: return None
@@ -300,12 +321,24 @@ class Perturber:
             lengths_t = torch.as_tensor(lengths, device=input_ids.device)
             return {"input_ids": input_ids, "attention_mask": attention_mask, "lengths": lengths_t}
         
-                
+        def _pick_dict_for_row(b: int) -> Dict[tuple, list]:
+            if not use_state_buckets:
+                return cos_sims
+            state_val = str(state_vals[b])  # from PLACE ③
+            if state_val not in cos_sims_by_state:
+                cos_sims_by_state[state_val] = defaultdict(list)
+            return cos_sims_by_state[state_val]
+
         cos_sims = defaultdict(list)
 
         # Decide pipeline: if targets provided, use fast GROUP path
         run_group = bool(resolved_perturb) or (self.cfg.perturb_type in {"group", "delete", "overexpress"})
         set_resolved = set(resolved_perturb or [])
+
+        state_cfg = self.cfg.cell_states_to_model
+        use_state_buckets = bool(state_cfg and "state_key" in state_cfg)
+        cos_sims = defaultdict(list)
+        cos_sims_by_state: Dict[str, Dict[tuple, list]] = {}
 
         if run_group:
             def _make_group_perturbation_batch(example):
@@ -369,6 +402,11 @@ class Perturber:
                 end = min(start + self.cfg.forward_batch_size, total)
                 mb = ds.select(range(start, end))
                 pb = perturbed_data.select(range(start, end))
+                if use_state_buckets:
+                    state_key = state_cfg["state_key"]
+                    state_vals: List[str] = list(mb[state_key])
+                else:
+                    state_vals = None 
 
                 with torch.no_grad():
                     batch_o = _make_batch(mb)
@@ -441,6 +479,9 @@ class Perturber:
                         mask = (ids_for_pairs != pad_id).to(sims_tok.dtype)  # [B, L’]
                         den = mask.sum(dim=1).clamp_min(1)
                         sims_cell = ((sims_tok * mask).sum(dim=1) / den).tolist()
+                        for b, sc in enumerate(sims_cell):
+                            target_dict = _pick_dict_for_row(b)
+                            target_dict[cell_key].append(float(sc))
                         cos_sims[cell_key].extend(sims_cell if isinstance(sims_cell, list) else [float(sims_cell)])
 
                     # GENE pairs from the same token-wise sims
@@ -450,14 +491,13 @@ class Perturber:
                         B, Lp = ids_np.shape
                         perturbed_list = list(set_resolved) if set_resolved else []
                         for b in range(B):
+                            target_dict = _pick_dict_for_row(b)
                             for t in range(Lp):
                                 affected_tok = int(ids_np[b, t])
                                 if affected_tok == pad_id:
                                     continue
                                 for pert_tok in (perturbed_list if perturbed_list else [affected_tok]):
-                                    cos_sims[(pert_tok, affected_tok)].append(float(sims_np[b, t]))
-
-                                        
+                                    target_dict[(pert_tok, affected_tok)].append(float(sims_np[b, t])) 
                     if self.cfg.emb_mode in {"gene", "cell_and_gene"}:
                         # Align sequences token-wise
                         if self.cfg.perturb_rank_shift in {"delete"} or self.cfg.perturb_type == "delete":
@@ -498,9 +538,13 @@ class Perturber:
                                     cos_sims[(pert_tok, affected_tok)].append(float(sims_np[b, t]))
 
             out_prefix = str(Path(output_directory) / output_prefix)
-            write_perturbation_dictionary(cos_sims, out_prefix)
-            return f"{out_prefix}_raw.pickle"
+            if use_state_buckets:
+                for state_val, d in cos_sims_by_state.items():
+                    write_perturbation_dictionary(d, f"{out_prefix}_{state_val}")
+            else:
+                write_perturbation_dictionary(cos_sims, out_prefix)
 
+            return f"{out_prefix}_raw.pickle"
         # ---- SINGLE fallback (only when no explicit target list) ----
         iterator = batcher.iter(ds, with_indices=False, progress_desc="Perturbing(single)")
         for batch in iterator:
