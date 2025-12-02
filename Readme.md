@@ -1,7 +1,7 @@
 # CancerStFormer
 
-A flexible framework for transformer-based analysis of spatial transcriptomics data. stFormer provides tools for data tokenization, pretraining, embedding extraction, in silico perturbation, and downstream classification.
-
+A flexible framework for transformer-based analysis of spatial transcriptomics data. stFormer provides tools for data tokenization, pretraining, embedding extraction, in silico perturbation, and downstream classification. <br>
+For more information, API, and tutorials; check out [ReadTheDocs](https://cancerstformer.readthedocs.io/en/latest/)
 ## Installation
 
 ```bash
